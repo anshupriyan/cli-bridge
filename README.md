@@ -39,7 +39,8 @@
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
 
 6. `execute_command(command: string, args: string[], cwd?: string, timeout?: number)`
-   - Spawns a process directly using Node's `child_process.spawn` (with `shell: false` to avoid shell injection vulnerabilities).
+   - Spawns a process directly using Node's `child_process.spawn`.
+   - Uses `shell: false` by default. On Windows, conditional `shell: true` is allowed ONLY for an allowlist of known package manager/build script wrappers (`npm`, `npx`, `yarn`, `pnpm`, `tsc`, `jest`, `eslint`, `prettier`).
    - `cwd` is validated to reside inside the workspace root; defaults to workspace root if not provided.
    - Automatically kills the command and returns a timeout error if execution exceeds the timeout (defaults to 30 seconds).
    - annotations: `readOnlyHint: false, destructiveHint: true, openWorldHint: true`.
@@ -54,17 +55,23 @@ The security model of `cli-bridge` relies on the following boundaries:
 - **Path Confinement**: All file paths (including working directories for execution) are strictly resolved relative to the workspace root using the safety resolver. Any traversal attempt out of the workspace root throws an access denied error.
 - **Absolute Path Traversal Protection**: The server validates resolved absolute paths (e.g., `C:\Windows\System32\...` or `/etc/...`) to ensure they reside strictly within the workspace root.
 - **Symlink Escape Protection**: Symlinks within the workspace root that point to files or directories outside of the workspace root are resolved and blocked by `resolveSafePath` check.
-- **Command Security**:
+- **Command Security & Heuristic Safety Scan**:
   > [!WARNING]
   > The `execute_command` tool has **no command allowlist**. It executes any executable available on the host system with the same user permissions as the Claude Desktop app.
   >
-  > To protect your system, write and execute tools are annotated with `destructiveHint: true`. This causes Claude Desktop (and other standard MCP clients) to prompt you for confirmation before executing these actions. Do not disable or bypass these prompts, as they are the primary gatekeeper for mutation and execution commands.
+  > By default, all commands are spawned directly using Node's `child_process.spawn` with `shell: false` to eliminate shell injection risks. On Windows, a small allowlist of common script wrapper commands (`npm`, `npx`, `yarn`, `pnpm`, `tsc`, `jest`, `eslint`, `prettier`) is conditionally spawned with `shell: true` to resolve batch wrapper executables.
+  >
+  > **Shell Escape Mitigation (Windows wrappers)**: To mitigate argument breakout vulnerabilities (like the general class of command injection exploits seen in Windows batch spawning), any command routed through the `shell: true` path is subject to strict argument scanning. If any argument contains shell metacharacters (`&`, `|`, `;`, `` ` ``, `$`, `>`, `<`, `^`), the execution is immediately blocked.
+  >
+  > To improve defense-in-depth, `execute_command` also performs a best-effort pre-flight path safety scan for filesystem paths outside the workspace root before running any command, and blocks execution if found. This is a heuristic string-scan, not a hard sandboxing boundary — it will not catch every case (e.g. paths read from environment variables, obfuscated/encoded paths, or non-filesystem risks like network requests to arbitrary hosts).
+  >
+  > Write and execute tools are annotated with `destructiveHint: true`. This causes Claude Desktop (and other standard MCP clients) to prompt you for confirmation before executing these actions. Do not disable or bypass these prompts, as manual approval of each `execute_command` call remains the primary safeguard.
 - **Audit Logging**:
   Every tool invocation is logged to an append-only JSON file at `WORKSPACE_ROOT/.cli-bridge-audit.log` for safety verification and tracking. The log records:
   - Timestamp (ISO format)
   - Tool name invoked
   - Input arguments (with content fields truncated to 200 characters for `write_file`/`edit_file` to keep the logs readable)
-  - Result status (`success` or `error`)
+  - Result status (`success`, `error`, or `blocked`)
   
   This audit file is automatically filtered out of `list_directory` and `search_files` results to avoid cluttering the workspace.
 

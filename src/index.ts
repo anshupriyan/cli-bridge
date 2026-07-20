@@ -69,6 +69,98 @@ export function resolveSafePath(root: string, userPath: string): string {
   return realPath;
 }
 
+/**
+ * Helper to check if a string matches url patterns (skipped by path heuristic scan)
+ */
+function isUrl(str: string): boolean {
+  return str.startsWith("http://") || 
+         str.startsWith("https://") || 
+         str.startsWith("git@") || 
+         str.includes("://");
+}
+
+/**
+ * Tighter heuristic to identify if a string looks like a filesystem path.
+ */
+function looksLikePath(str: string): boolean {
+  if (isUrl(str)) return false;
+  
+  // 1. Relative traversal
+  if (str.includes("../") || str.includes("..\\")) {
+    return true;
+  }
+  
+  // 2. Drive letter prefix
+  if (/^[A-Za-z]:[/\\]/.test(str)) {
+    return true;
+  }
+  
+  // 3. Leading dot/dot-dot or slash patterns
+  if (str.startsWith("./") || str.startsWith(".\\") || str.startsWith("/") || str.startsWith("\\")) {
+    return true;
+  }
+  
+  // 4. Contains at least two path separators
+  const slashCount = (str.match(/\//g) || []).length + (str.match(/\\/g) || []).length;
+  if (slashCount >= 2) {
+    return true;
+  }
+  
+  // 5. Contains exactly one path separator and has a recognizable file extension
+  if (slashCount === 1 && /\.[A-Za-z0-9]{1,5}$/.test(str)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Heuristically extracts and checks paths referenced in commands/args.
+ * Returns array of paths that resolve outside the root.
+ */
+export function scanForUnsafePaths(command: string, args: string[]): string[] {
+  const candidates = [command, ...args];
+  const unsafePaths: string[] = [];
+  
+  for (const str of candidates) {
+    if (looksLikePath(str)) {
+      try {
+        resolveSafePath(workspaceRoot, str);
+      } catch (err) {
+        unsafePaths.push(str);
+      }
+    }
+  }
+  
+  return unsafePaths;
+}
+
+// Windows wrappers that require shell execution
+const WINDOWS_WRAPPERS = ["npm", "npx", "yarn", "pnpm", "tsc", "jest", "eslint", "prettier"];
+const SHELL_METACHARS = ["&", "|", ";", "`", "$", ">", "<", "^"];
+
+/**
+ * Check if the given command is a known Windows wrapper script.
+ */
+function shouldWinShell(command: string): boolean {
+  if (process.platform !== "win32") return false;
+  const basename = path.basename(command).toLowerCase();
+  return WINDOWS_WRAPPERS.some(wrapper => 
+    basename === wrapper || 
+    basename === `${wrapper}.cmd` || 
+    basename === `${wrapper}.bat`
+  );
+}
+
+/**
+ * Check if the arguments contain shell metacharacters.
+ */
+function hasShellMetacharacters(args: string[]): boolean {
+  return args.some(arg => 
+    SHELL_METACHARS.some(char => arg.includes(char))
+  );
+}
+
 // Zod schemas for input validation
 const ReadFileSchema = z.object({
   path: z.string().describe("Path to the file to read, relative to workspace root")
@@ -91,7 +183,7 @@ const WriteFileSchema = z.object({
 
 const EditFileSchema = z.object({
   path: z.string().describe("Path to the file to edit, relative to workspace root"),
-  old_str: z.string().describe("The exact unique string to search for in the file"),
+  old_str: z.string().describe("The exact unique string to search for in the file (must appear exactly once)"),
   new_str: z.string().describe("The string to replace the old string with")
 });
 
@@ -350,13 +442,13 @@ const TOOLS = [
   },
   {
     name: "execute_command",
-    description: "Execute a command-line tool in the workspace. Timeout defaults to 30s. Spawns directly without a shell wrapper.",
+    description: "Execute a command-line tool in the workspace. Timeout defaults to 30s. Spawns directly without a shell wrapper by default, but supports allowlisted wrappers on Windows.",
     inputSchema: {
       type: "object",
       properties: {
         command: {
           type: "string",
-          description: "The executable command to run (e.g. 'git', 'node')"
+          description: "The executable command to run (e.g. 'git', 'node', 'npm')"
         },
         args: {
           type: "array",
@@ -407,7 +499,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 /**
  * Appends a JSON structured audit log line to workspaceRoot/.cli-bridge-audit.log
  */
-function appendAuditLog(tool: string, args: any, status: "success" | "error") {
+function appendAuditLog(tool: string, args: any, status: string) {
   try {
     const logPath = path.join(workspaceRoot, ".cli-bridge-audit.log");
     
@@ -445,11 +537,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Log every tool call to stderr
   console.error(`[cli-bridge] Tool invocation: ${toolName} with args ${JSON.stringify(args)}`);
   
-  let status: "success" | "error" = "success";
+  let status = "success";
   try {
     const response = await handleToolCall(toolName, args);
     if (response.isError) {
-      status = "error";
+      if (response.content && response.content[0] && response.content[0].text && response.content[0].text.includes("Blocked:")) {
+        status = "blocked";
+      } else {
+        status = "error";
+      }
     }
     appendAuditLog(toolName, args, status);
     return response;
@@ -624,10 +720,34 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         };
       }
       
+      // Pre-flight path safety scan
+      const unsafePaths = scanForUnsafePaths(parsed.data.command, parsed.data.args);
+      if (unsafePaths.length > 0) {
+        const blockedMsg = `Blocked: command references path(s) outside workspace root: ${JSON.stringify(unsafePaths)}. If this is intentional, note this tool only allows execution scoped to the workspace root.`;
+        console.error(`[cli-bridge] ${blockedMsg}`);
+        return {
+          content: [{ type: "text", text: blockedMsg }],
+          isError: true
+        };
+      }
+      
       const resolvedCwd = resolveSafePath(workspaceRoot, parsed.data.cwd || ".");
       const timeoutMs = parsed.data.timeout || 30000;
       
-      console.error(`[cli-bridge] Executing command: "${parsed.data.command}" with args: ${JSON.stringify(parsed.data.args)} in cwd: "${resolvedCwd}" (timeout: ${timeoutMs}ms)`);
+      // Determine if command needs shell wrapper on Windows
+      const useShell = shouldWinShell(parsed.data.command);
+      
+      // Hardened metacharacter scan for shell: true path to prevent cmd breakout vulnerabilities
+      if (useShell && hasShellMetacharacters(parsed.data.args)) {
+        const blockedMsg = `Blocked: command arguments contain characters not permitted for shell wrapper scripts: ${JSON.stringify(parsed.data.args)}. Permitted arguments cannot contain the following characters: ${SHELL_METACHARS.join(" ")}`;
+        console.error(`[cli-bridge] ${blockedMsg}`);
+        return {
+          content: [{ type: "text", text: blockedMsg }],
+          isError: true
+        };
+      }
+      
+      console.error(`[cli-bridge] Executing command: "${parsed.data.command}" with args: ${JSON.stringify(parsed.data.args)} in cwd: "${resolvedCwd}" (timeout: ${timeoutMs}ms, shell: ${useShell})`);
       
       return new Promise<any>((resolve) => {
         let stdout = "";
@@ -636,7 +756,7 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         
         const child = spawn(parsed.data.command, parsed.data.args, {
           cwd: resolvedCwd,
-          shell: false
+          shell: useShell
         });
         
         const timer = setTimeout(() => {
