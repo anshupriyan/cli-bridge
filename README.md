@@ -14,11 +14,13 @@
 2. `list_directory(path: string, recursive?: boolean)`
    - Lists the directory contents including names, sizes, and whether each item is a directory.
    - Constrained to the workspace root directory.
+   - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
    - annotations: `readOnlyHint: true`.
 
 3. `search_files(pattern: string, path?: string)`
    - Recursively searches for files matching a glob pattern (e.g. `*.ts`, `**/*.js`).
    - Constrained to the workspace root directory.
+   - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
    - annotations: `readOnlyHint: true`.
 
 ### Write & Execution Tools (Phase 2)
@@ -27,11 +29,12 @@
    - Full file overwrite (creates or replaces files). Automatically creates parent directories if needed.
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
-   - Logs resolved path and content length to stderr.
+   - Logs resolved path and content length to stderr and the audit log.
 
 5. `edit_file(path: string, old_str: string, new_str: string)`
    - Performs find-and-replace on a unique string inside a file.
    - Errors if `old_str` matches zero times or more than once in the file (ambiguous edits are rejected).
+     - *Note: `old_str` must appear exactly once in the file — this is intentionally strict to prevent ambiguous edits, but means `edit_file` will fail on files with repeated boilerplate or whitespace-sensitive matches. If this happens, fall back to `write_file` with the full new content.*
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
 
@@ -40,19 +43,30 @@
    - `cwd` is validated to reside inside the workspace root; defaults to workspace root if not provided.
    - Automatically kills the command and returns a timeout error if execution exceeds the timeout (defaults to 30 seconds).
    - annotations: `readOnlyHint: false, destructiveHint: true, openWorldHint: true`.
-   - Logs command, args, and cwd to stderr before executing.
+   - Logs command, args, and cwd to stderr and the audit log before executing.
 
 ---
 
-## Safety Constraints
+## Security Model
+
+The security model of `cli-bridge` relies on the following boundaries:
 
 - **Path Confinement**: All file paths (including working directories for execution) are strictly resolved relative to the workspace root using the safety resolver. Any traversal attempt out of the workspace root throws an access denied error.
-- **Protocol Safety**: All console logs and debug outputs are written to `stderr` so as not to corrupt JSON-RPC communication on `stdout`.
-- **Command Security & Approval**:
+- **Absolute Path Traversal Protection**: The server validates resolved absolute paths (e.g., `C:\Windows\System32\...` or `/etc/...`) to ensure they reside strictly within the workspace root.
+- **Symlink Escape Protection**: Symlinks within the workspace root that point to files or directories outside of the workspace root are resolved and blocked by `resolveSafePath` check.
+- **Command Security**:
   > [!WARNING]
   > The `execute_command` tool has **no command allowlist**. It executes any executable available on the host system with the same user permissions as the Claude Desktop app.
   >
-  > To protect your system, write and execute tools are annotated with `destructiveHint: true`. This causes Claude Desktop (and other standard MCP clients) to prompt you for confirmation before executing these actions. Do not disable or bypass these prompts.
+  > To protect your system, write and execute tools are annotated with `destructiveHint: true`. This causes Claude Desktop (and other standard MCP clients) to prompt you for confirmation before executing these actions. Do not disable or bypass these prompts, as they are the primary gatekeeper for mutation and execution commands.
+- **Audit Logging**:
+  Every tool invocation is logged to an append-only JSON file at `WORKSPACE_ROOT/.cli-bridge-audit.log` for safety verification and tracking. The log records:
+  - Timestamp (ISO format)
+  - Tool name invoked
+  - Input arguments (with content fields truncated to 200 characters for `write_file`/`edit_file` to keep the logs readable)
+  - Result status (`success` or `error`)
+  
+  This audit file is automatically filtered out of `list_directory` and `search_files` results to avoid cluttering the workspace.
 
 ---
 

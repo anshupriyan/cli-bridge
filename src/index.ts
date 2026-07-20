@@ -29,21 +29,44 @@ try {
 console.error(`[cli-bridge] Workspace root set to: ${workspaceRoot}`);
 
 /**
- * Resolves user path relative to workspace root and prevents directory traversal.
+ * Resolves user path relative to workspace root, checks for directory traversal,
+ * absolute path escapes, and resolves symlinks securely.
  * Throws an error if the path resolves outside the workspace root.
  */
 export function resolveSafePath(root: string, userPath: string): string {
   const resolvedRoot = path.resolve(root);
-  const resolvedPath = path.resolve(resolvedRoot, userPath);
-  
-  const relative = path.relative(resolvedRoot, resolvedPath);
-  const isOutside = relative.startsWith("..") || path.isAbsolute(relative);
-  
-  if (isOutside) {
-    throw new Error(`Access denied: Path "${userPath}" resolves outside of workspace root "${resolvedRoot}".`);
+  let realRoot = resolvedRoot;
+  try {
+    realRoot = fs.realpathSync(resolvedRoot);
+  } catch (err) {
+    // Fall back to resolvedRoot if it cannot be resolved yet
   }
-  
-  return resolvedPath;
+
+  const resolvedPath = path.resolve(realRoot, userPath);
+  let realPath = resolvedPath;
+  try {
+    realPath = fs.realpathSync(resolvedPath);
+  } catch (err) {
+    // If the path doesn't exist (e.g. for write_file creating a new file),
+    // resolve the realpath of the parent directory instead and join the basename.
+    const parentDir = path.dirname(resolvedPath);
+    const filename = path.basename(resolvedPath);
+    try {
+      const realParent = fs.realpathSync(parentDir);
+      realPath = path.resolve(realParent, filename);
+    } catch (parentErr) {
+      // Fall back to resolvedPath if parent directory doesn't exist
+    }
+  }
+
+  const relative = path.relative(realRoot, realPath);
+  const isOutside = relative.startsWith("..") || path.isAbsolute(relative);
+
+  if (isOutside) {
+    throw new Error(`Access denied: Path "${userPath}" resolves outside of workspace root "${realRoot}".`);
+  }
+
+  return realPath;
 }
 
 // Zod schemas for input validation
@@ -86,11 +109,14 @@ interface DirectoryEntry {
 }
 
 /**
- * Recursively walks directory to build the list of entries
+ * Recursively walks directory to build the list of entries (excluding the audit log)
  */
 async function walkDirectory(dir: string, baseDir: string, entries: DirectoryEntry[] = []): Promise<DirectoryEntry[]> {
   const dirents = await fs.promises.readdir(dir, { withFileTypes: true });
   for (const dirent of dirents) {
+    if (dirent.name === ".cli-bridge-audit.log") {
+      continue;
+    }
     const fullPath = path.join(dir, dirent.name);
     let resolvedPath: string;
     try {
@@ -131,7 +157,7 @@ async function walkDirectory(dir: string, baseDir: string, entries: DirectoryEnt
 }
 
 /**
- * Lists the directory entries, either recursively or just the top level
+ * Lists the directory entries, either recursively or just the top level (excluding the audit log)
  */
 async function listDirectory(dirPath: string, recursive: boolean): Promise<DirectoryEntry[]> {
   if (recursive) {
@@ -141,6 +167,9 @@ async function listDirectory(dirPath: string, recursive: boolean): Promise<Direc
   const dirents = await fs.promises.readdir(dirPath, { withFileTypes: true });
   const result: DirectoryEntry[] = [];
   for (const dirent of dirents) {
+    if (dirent.name === ".cli-bridge-audit.log") {
+      continue;
+    }
     const fullPath = path.join(dirPath, dirent.name);
     let resolvedPath: string;
     try {
@@ -304,7 +333,7 @@ const TOOLS = [
         },
         old_str: {
           type: "string",
-          description: "The exact unique string to search for in the file"
+          description: "The exact unique string to search for in the file (must appear exactly once)"
         },
         new_str: {
           type: "string",
@@ -375,6 +404,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+/**
+ * Appends a JSON structured audit log line to workspaceRoot/.cli-bridge-audit.log
+ */
+function appendAuditLog(tool: string, args: any, status: "success" | "error") {
+  try {
+    const logPath = path.join(workspaceRoot, ".cli-bridge-audit.log");
+    
+    // Create copy of args and truncate content fields if necessary
+    const formattedArgs = { ...args };
+    if (tool === "write_file" && typeof formattedArgs.content === "string") {
+      formattedArgs.content = formattedArgs.content.substring(0, 200) + (formattedArgs.content.length > 200 ? "..." : "");
+    } else if (tool === "edit_file") {
+      if (typeof formattedArgs.old_str === "string") {
+        formattedArgs.old_str = formattedArgs.old_str.substring(0, 200) + (formattedArgs.old_str.length > 200 ? "..." : "");
+      }
+      if (typeof formattedArgs.new_str === "string") {
+        formattedArgs.new_str = formattedArgs.new_str.substring(0, 200) + (formattedArgs.new_str.length > 200 ? "..." : "");
+      }
+    }
+    
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      tool,
+      args: formattedArgs,
+      status
+    };
+    
+    fs.appendFileSync(logPath, JSON.stringify(logEntry) + "\n", "utf-8");
+  } catch (err) {
+    console.error(`[cli-bridge] Failed to write audit log:`, err);
+  }
+}
+
 // Register call tool handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolName = request.params.name;
@@ -383,239 +445,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Log every tool call to stderr
   console.error(`[cli-bridge] Tool invocation: ${toolName} with args ${JSON.stringify(args)}`);
   
+  let status: "success" | "error" = "success";
   try {
-    switch (toolName) {
-      case "read_file": {
-        const parsed = ReadFileSchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
-        
-        // Verify it is a file
-        const stat = await fs.promises.stat(resolvedPath);
-        if (!stat.isFile()) {
-          return {
-            content: [{ type: "text", text: `Path "${parsed.data.path}" is not a file.` }],
-            isError: true
-          };
-        }
-        
-        const content = await fs.promises.readFile(resolvedPath, "utf-8");
-        return {
-          content: [{ type: "text", text: content }]
-        };
-      }
-      
-      case "list_directory": {
-        const parsed = ListDirectorySchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
-        
-        // Verify it is a directory
-        const stat = await fs.promises.stat(resolvedPath);
-        if (!stat.isDirectory()) {
-          return {
-            content: [{ type: "text", text: `Path "${parsed.data.path}" is not a directory.` }],
-            isError: true
-          };
-        }
-        
-        const entries = await listDirectory(resolvedPath, !!parsed.data.recursive);
-        return {
-          content: [{ type: "text", text: JSON.stringify(entries, null, 2) }]
-        };
-      }
-      
-      case "search_files": {
-        const parsed = SearchFilesSchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const targetDir = resolveSafePath(workspaceRoot, parsed.data.path || ".");
-        
-        // Verify it is a directory
-        const stat = await fs.promises.stat(targetDir);
-        if (!stat.isDirectory()) {
-          return {
-            content: [{ type: "text", text: `Path "${parsed.data.path || "."}" is not a directory.` }],
-            isError: true
-          };
-        }
-        
-        const results = await searchFiles(targetDir, parsed.data.pattern);
-        return {
-          content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
-        };
-      }
-      
-      case "write_file": {
-        const parsed = WriteFileSchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
-        console.error(`[cli-bridge] Writing file: "${resolvedPath}" (content length: ${parsed.data.content.length} characters)`);
-        
-        // Ensure parent directories exist
-        await fs.promises.mkdir(path.dirname(resolvedPath), { recursive: true });
-        
-        await fs.promises.writeFile(resolvedPath, parsed.data.content, "utf-8");
-        return {
-          content: [{ type: "text", text: `Successfully wrote file: ${parsed.data.path}` }]
-        };
-      }
-      
-      case "edit_file": {
-        const parsed = EditFileSchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
-        console.error(`[cli-bridge] Editing file: "${resolvedPath}"`);
-        
-        // Verify it is a file
-        const stat = await fs.promises.stat(resolvedPath);
-        if (!stat.isFile()) {
-          return {
-            content: [{ type: "text", text: `Path "${parsed.data.path}" is not a file.` }],
-            isError: true
-          };
-        }
-        
-        const content = await fs.promises.readFile(resolvedPath, "utf-8");
-        const oldStr = parsed.data.old_str;
-        const newStr = parsed.data.new_str;
-        
-        // Count occurrences of oldStr
-        let count = 0;
-        let pos = content.indexOf(oldStr);
-        while (pos !== -1) {
-          count++;
-          if (count > 1) break;
-          pos = content.indexOf(oldStr, pos + oldStr.length);
-        }
-        
-        if (count === 0) {
-          return {
-            content: [{ type: "text", text: `Error: The search string ("${oldStr}") was not found in the file.` }],
-            isError: true
-          };
-        }
-        
-        if (count > 1) {
-          return {
-            content: [{ type: "text", text: `Error: The search string ("${oldStr}") was found multiple times. Edits must be unique.` }],
-            isError: true
-          };
-        }
-        
-        const updatedContent = content.replace(oldStr, newStr);
-        await fs.promises.writeFile(resolvedPath, updatedContent, "utf-8");
-        return {
-          content: [{ type: "text", text: `Successfully edited file: ${parsed.data.path}` }]
-        };
-      }
-      
-      case "execute_command": {
-        const parsed = ExecuteCommandSchema.safeParse(args);
-        if (!parsed.success) {
-          return {
-            content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
-            isError: true
-          };
-        }
-        
-        const resolvedCwd = resolveSafePath(workspaceRoot, parsed.data.cwd || ".");
-        const timeoutMs = parsed.data.timeout || 30000;
-        
-        console.error(`[cli-bridge] Executing command: "${parsed.data.command}" with args: ${JSON.stringify(parsed.data.args)} in cwd: "${resolvedCwd}" (timeout: ${timeoutMs}ms)`);
-        
-        return new Promise((resolve) => {
-          let stdout = "";
-          let stderr = "";
-          let killedDueToTimeout = false;
-          
-          const child = spawn(parsed.data.command, parsed.data.args, {
-            cwd: resolvedCwd,
-            shell: false
-          });
-          
-          const timer = setTimeout(() => {
-            killedDueToTimeout = true;
-            child.kill("SIGKILL");
-          }, timeoutMs);
-          
-          child.stdout.on("data", (data) => {
-            stdout += data.toString();
-          });
-          
-          child.stderr.on("data", (data) => {
-            stderr += data.toString();
-          });
-          
-          child.on("error", (error) => {
-            clearTimeout(timer);
-            resolve({
-              content: [{ type: "text", text: `Failed to start command: ${error.message}` }],
-              isError: true
-            });
-          });
-          
-          child.on("close", (code) => {
-            clearTimeout(timer);
-            if (killedDueToTimeout) {
-              resolve({
-                content: [{ type: "text", text: `Error: Command execution timed out after ${timeoutMs}ms.` }],
-                isError: true
-              });
-            } else {
-              resolve({
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      stdout,
-                      stderr,
-                      exitCode: code
-                    }, null, 2)
-                  }
-                ]
-              });
-            }
-          });
-        });
-      }
-      
-      default:
-        return {
-          content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
-          isError: true
-        };
+    const response = await handleToolCall(toolName, args);
+    if (response.isError) {
+      status = "error";
     }
+    appendAuditLog(toolName, args, status);
+    return response;
   } catch (error: any) {
+    appendAuditLog(toolName, args, "error");
     console.error(`[cli-bridge] Tool error in ${toolName}: ${error.stack || error.message || error}`);
     return {
       content: [{ type: "text", text: error.message || String(error) }],
@@ -623,6 +462,236 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+/**
+ * Handles individual tool requests.
+ */
+async function handleToolCall(toolName: string, args: any): Promise<any> {
+  switch (toolName) {
+    case "read_file": {
+      const parsed = ReadFileSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
+      
+      const stat = await fs.promises.stat(resolvedPath);
+      if (!stat.isFile()) {
+        return {
+          content: [{ type: "text", text: `Path "${parsed.data.path}" is not a file.` }],
+          isError: true
+        };
+      }
+      
+      const content = await fs.promises.readFile(resolvedPath, "utf-8");
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    }
+    
+    case "list_directory": {
+      const parsed = ListDirectorySchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
+      
+      const stat = await fs.promises.stat(resolvedPath);
+      if (!stat.isDirectory()) {
+        return {
+          content: [{ type: "text", text: `Path "${parsed.data.path}" is not a directory.` }],
+          isError: true
+        };
+      }
+      
+      const entries = await listDirectory(resolvedPath, !!parsed.data.recursive);
+      return {
+        content: [{ type: "text", text: JSON.stringify(entries, null, 2) }]
+      };
+    }
+    
+    case "search_files": {
+      const parsed = SearchFilesSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const targetDir = resolveSafePath(workspaceRoot, parsed.data.path || ".");
+      
+      const stat = await fs.promises.stat(targetDir);
+      if (!stat.isDirectory()) {
+        return {
+          content: [{ type: "text", text: `Path "${parsed.data.path || "."}" is not a directory.` }],
+          isError: true
+        };
+      }
+      
+      const results = await searchFiles(targetDir, parsed.data.pattern);
+      return {
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
+      };
+    }
+    
+    case "write_file": {
+      const parsed = WriteFileSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
+      console.error(`[cli-bridge] Writing file: "${resolvedPath}" (content length: ${parsed.data.content.length} characters)`);
+      
+      await fs.promises.mkdir(path.dirname(resolvedPath), { recursive: true });
+      await fs.promises.writeFile(resolvedPath, parsed.data.content, "utf-8");
+      return {
+        content: [{ type: "text", text: `Successfully wrote file: ${parsed.data.path}` }]
+      };
+    }
+    
+    case "edit_file": {
+      const parsed = EditFileSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const resolvedPath = resolveSafePath(workspaceRoot, parsed.data.path);
+      console.error(`[cli-bridge] Editing file: "${resolvedPath}"`);
+      
+      const stat = await fs.promises.stat(resolvedPath);
+      if (!stat.isFile()) {
+        return {
+          content: [{ type: "text", text: `Path "${parsed.data.path}" is not a file.` }],
+          isError: true
+        };
+      }
+      
+      const content = await fs.promises.readFile(resolvedPath, "utf-8");
+      const oldStr = parsed.data.old_str;
+      const newStr = parsed.data.new_str;
+      
+      let count = 0;
+      let pos = content.indexOf(oldStr);
+      while (pos !== -1) {
+        count++;
+        if (count > 1) break;
+        pos = content.indexOf(oldStr, pos + oldStr.length);
+      }
+      
+      if (count === 0) {
+        return {
+          content: [{ type: "text", text: `Error: The search string ("${oldStr}") was not found in the file.` }],
+          isError: true
+        };
+      }
+      
+      if (count > 1) {
+        return {
+          content: [{ type: "text", text: `Error: The search string ("${oldStr}") was found multiple times. Edits must be unique.` }],
+          isError: true
+        };
+      }
+      
+      const updatedContent = content.replace(oldStr, newStr);
+      await fs.promises.writeFile(resolvedPath, updatedContent, "utf-8");
+      return {
+        content: [{ type: "text", text: `Successfully edited file: ${parsed.data.path}` }]
+      };
+    }
+    
+    case "execute_command": {
+      const parsed = ExecuteCommandSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const resolvedCwd = resolveSafePath(workspaceRoot, parsed.data.cwd || ".");
+      const timeoutMs = parsed.data.timeout || 30000;
+      
+      console.error(`[cli-bridge] Executing command: "${parsed.data.command}" with args: ${JSON.stringify(parsed.data.args)} in cwd: "${resolvedCwd}" (timeout: ${timeoutMs}ms)`);
+      
+      return new Promise<any>((resolve) => {
+        let stdout = "";
+        let stderr = "";
+        let killedDueToTimeout = false;
+        
+        const child = spawn(parsed.data.command, parsed.data.args, {
+          cwd: resolvedCwd,
+          shell: false
+        });
+        
+        const timer = setTimeout(() => {
+          killedDueToTimeout = true;
+          child.kill("SIGKILL");
+        }, timeoutMs);
+        
+        child.stdout.on("data", (data) => {
+          stdout += data.toString();
+        });
+        
+        child.stderr.on("data", (data) => {
+          stderr += data.toString();
+        });
+        
+        child.on("error", (error) => {
+          clearTimeout(timer);
+          resolve({
+            content: [{ type: "text", text: `Failed to start command: ${error.message}` }],
+            isError: true
+          });
+        });
+        
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          if (killedDueToTimeout) {
+            resolve({
+              content: [{ type: "text", text: `Error: Command execution timed out after ${timeoutMs}ms.` }],
+              isError: true
+            });
+          } else {
+            resolve({
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    stdout,
+                    stderr,
+                    exitCode: code
+                  }, null, 2)
+                }
+              ]
+            });
+          }
+        });
+      });
+    }
+    
+    default:
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
+        isError: true
+      };
+  }
+}
 
 // Run server using Stdio transport
 async function run() {
