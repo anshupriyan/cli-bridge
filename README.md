@@ -6,8 +6,9 @@
 
 ### Read-Only Tools
 
-1. `read_file(path: string)`
+1. `read_file(path: string, start_line?: number, end_line?: number)`
    - Reads file contents as UTF-8 text.
+   - Supports optional `start_line` and `end_line` to slice and read specific line ranges (1-based, inclusive).
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: true, destructiveHint: false`.
 
@@ -23,26 +24,32 @@
    - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
    - annotations: `readOnlyHint: true`.
 
-4. `get_recent_journal_entries(count?: number)`
+4. `grep_content(pattern: string, path?: string, case_sensitive?: boolean, max_results?: number)`
+   - Performs token-efficient searches for a fixed string pattern in files.
+   - Spawns the bundled `@vscode/ripgrep` binary for high performance, with a recursive manual readline scanner as a safety fallback.
+   - Returns only relative file path, line number, and match text (never full file contents). Capped at `max_results` (default 50).
+   - annotations: `readOnlyHint: true`.
+
+5. `get_recent_journal_entries(count?: number)`
    - Reads the last N entries from `PROJECT_LOG.md`.
    - annotations: `readOnlyHint: true`.
 
 ### Write & Execution Tools (Phase 2)
 
-5. `write_file(path: string, content: string)`
+6. `write_file(path: string, content: string)`
    - Full file overwrite (creates or replaces files). Automatically creates parent directories if needed.
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
    - Logs resolved path and content length to stderr and the audit log.
 
-6. `edit_file(path: string, old_str: string, new_str: string)`
+7. `edit_file(path: string, old_str: string, new_str: string)`
    - Performs find-and-replace on a unique string inside a file.
    - Errors if `old_str` matches zero times or more than once in the file (ambiguous edits are rejected).
      - *Note: `old_str` must appear exactly once in the file — this is intentionally strict to prevent ambiguous edits, but means `edit_file` will fail on files with repeated boilerplate or whitespace-sensitive matches. If this happens, fall back to `write_file` with the full new content.*
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
 
-7. `execute_command(command: string, args: string[], cwd?: string, timeout?: number)`
+8. `execute_command(command: string, args: string[], cwd?: string, timeout?: number)`
    - Spawns a process directly using Node's `child_process.spawn`.
    - Uses `shell: false` by default. On Windows, conditional `shell: true` is allowed ONLY for an allowlist of known package manager/build script wrappers (`npm`, `npx`, `yarn`, `pnpm`, `tsc`, `jest`, `eslint`, `prettier`).
    - `cwd` is validated to reside inside the workspace root; defaults to workspace root if not provided.
@@ -50,7 +57,7 @@
    - annotations: `readOnlyHint: false, destructiveHint: true, openWorldHint: true`.
    - Logs command, args, and cwd to stderr and the audit log before executing.
 
-8. `log_journal_entry(summary: string, files_changed?: string[], commit_hash?: string)`
+9. `log_journal_entry(summary: string, files_changed?: string[], commit_hash?: string)`
    - Appends a structured log entry to `PROJECT_LOG.md` detailing completed work and changed files.
    - annotations: `readOnlyHint: false, destructiveHint: false, idempotentHint: false`.
 
@@ -82,6 +89,17 @@ The security model of `cli-bridge` relies on the following boundaries:
   - Result status (`success`, `error`, or `blocked`)
   
   This audit file is automatically filtered out of `list_directory` and `search_files` results to avoid cluttering the workspace.
+
+---
+
+## Token-Efficient Workflows
+
+To optimize token usage and context window consumption, the following workflows are recommended:
+
+1. **Targeted Code Location**: Always use `grep_content` to locate relevant keywords or lines of code before reading anything. This avoids reading large directories or files blind.
+2. **Selective Reading**: Use `read_file` with `start_line` and `end_line` once the file section of interest is identified. Avoid reading full files if only a slice is needed.
+3. **Contiguous and Minimal Modifications**: Use `edit_file` instead of `write_file` for updating existing codebase files. This ensures that you only transmit search-and-replace snippets rather than full file overlays.
+4. **Factual Verification**: Use Git commands (`git diff`, `git log`, `git show`) via `execute_command` to inspect committed changes rather than re-reading the full files after edits.
 
 ---
 

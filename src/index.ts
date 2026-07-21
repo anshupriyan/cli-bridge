@@ -8,6 +8,8 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
+import * as readline from "readline";
+import { rgPath } from "@vscode/ripgrep";
 
 // Initialize workspace root
 const workspaceRootEnv = process.env.WORKSPACE_ROOT;
@@ -27,6 +29,7 @@ try {
 }
 
 console.error(`[cli-bridge] Workspace root set to: ${workspaceRoot}`);
+console.error(`[cli-bridge] Using bundled ripgrep binary: ${rgPath}`);
 
 /**
  * Ensures that WORKSPACE_ROOT/.gitignore exists and contains the required log exclusions.
@@ -201,7 +204,9 @@ function hasShellMetacharacters(args: string[]): boolean {
 
 // Zod schemas for input validation
 const ReadFileSchema = z.object({
-  path: z.string().describe("Path to the file to read, relative to workspace root")
+  path: z.string().describe("Path to the file to read, relative to workspace root"),
+  start_line: z.number().optional().describe("Optional 1-based start line to read from"),
+  end_line: z.number().optional().describe("Optional 1-based end line to read to (inclusive)")
 });
 
 const ListDirectorySchema = z.object({
@@ -240,6 +245,13 @@ const JournalEntrySchema = z.object({
 
 const GetRecentJournalEntriesSchema = z.object({
   count: z.number().optional().describe("Number of recent entries to retrieve (defaults to 5)")
+});
+
+const GrepContentSchema = z.object({
+  pattern: z.string().describe("Fixed string pattern to search for in files"),
+  path: z.string().optional().describe("Optional subdirectory path to search within, relative to workspace root (defaults to root)"),
+  case_sensitive: z.boolean().optional().describe("Whether the search should be case-sensitive (defaults to false)"),
+  max_results: z.number().optional().describe("Maximum number of results to return (defaults to 50)")
 });
 
 interface DirectoryEntry {
@@ -376,17 +388,197 @@ async function searchFiles(searchDir: string, pattern: string): Promise<string[]
   return matchedFiles;
 }
 
+interface GrepMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+/**
+ * Performs search using either @vscode/ripgrep or falling back to manual readline matching.
+ */
+async function performGrep(
+  targetDir: string,
+  pattern: string,
+  caseSensitive: boolean,
+  maxResults: number
+): Promise<GrepMatch[]> {
+  try {
+    return await ripgrepGrep(targetDir, pattern, caseSensitive, maxResults);
+  } catch (err: any) {
+    console.error(`[cli-bridge] Ripgrep failed, falling back to manual grep: ${err.message}`);
+    return manualGrep(targetDir, pattern, caseSensitive, maxResults);
+  }
+}
+
+async function ripgrepGrep(
+  targetDir: string,
+  pattern: string,
+  caseSensitive: boolean,
+  maxResults: number
+): Promise<GrepMatch[]> {
+  return new Promise((resolve, reject) => {
+    const matches: GrepMatch[] = [];
+    const args = ["-n", "-H", "--no-heading", "-F"];
+    if (!caseSensitive) {
+      args.push("-i");
+    }
+    // Search inside targetDir (passed as ".")
+    args.push(pattern, ".");
+    
+    const child = spawn(rgPath, args, {
+      cwd: targetDir
+    });
+    
+    let stdout = "";
+    let parseError: any = null;
+    
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() || "";
+      
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        
+        const firstColon = line.indexOf(":");
+        const secondColon = line.indexOf(":", firstColon + 1);
+        if (firstColon !== -1 && secondColon !== -1) {
+          const relPath = line.substring(0, firstColon);
+          const lineNo = parseInt(line.substring(firstColon + 1, secondColon), 10);
+          const text = line.substring(secondColon + 1);
+          
+          const fullPath = path.join(targetDir, relPath);
+          let resolvedRelPath: string;
+          try {
+            const realP = resolveSafePath(workspaceRoot, fullPath);
+            resolvedRelPath = path.relative(workspaceRoot, realP).replace(/\\/g, "/");
+          } catch {
+            continue;
+          }
+          
+          matches.push({
+            path: resolvedRelPath,
+            line: lineNo,
+            text
+          });
+          
+          if (matches.length >= maxResults) {
+            child.kill();
+            break;
+          }
+        }
+      }
+    });
+    
+    child.on("error", (err) => {
+      parseError = err;
+    });
+    
+    child.on("close", (code) => {
+      if (parseError) {
+        reject(parseError);
+      } else {
+        resolve(matches);
+      }
+    });
+  });
+}
+
+async function manualGrep(
+  targetDir: string,
+  pattern: string,
+  caseSensitive: boolean,
+  maxResults: number
+): Promise<GrepMatch[]> {
+  const matches: GrepMatch[] = [];
+  
+  async function search(dir: string) {
+    if (matches.length >= maxResults) return;
+    
+    const dirents = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const dirent of dirents) {
+      if (matches.length >= maxResults) return;
+      
+      const name = dirent.name;
+      if (name === "node_modules" || name === "build" || name === ".git" || name === ".cli-bridge-audit.log") {
+        continue;
+      }
+      
+      const fullPath = path.join(dir, name);
+      let resolvedPath: string;
+      try {
+        resolvedPath = resolveSafePath(workspaceRoot, fullPath);
+      } catch {
+        continue;
+      }
+      
+      if (dirent.isDirectory()) {
+        await search(resolvedPath);
+      } else if (dirent.isFile()) {
+        await searchFile(resolvedPath);
+      }
+    }
+  }
+  
+  async function searchFile(filePath: string) {
+    const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
+    const rl = readline.createInterface({
+      input: stream,
+      crlfDelay: Infinity
+    });
+    
+    const relativePath = path.relative(workspaceRoot, filePath).replace(/\\/g, "/");
+    let lineNumber = 0;
+    
+    let matcher: (text: string) => boolean;
+    if (caseSensitive) {
+      matcher = (text) => text.includes(pattern);
+    } else {
+      const lowerPattern = pattern.toLowerCase();
+      matcher = (text) => text.toLowerCase().includes(lowerPattern);
+    }
+    
+    for await (const line of rl) {
+      lineNumber++;
+      if (matcher(line)) {
+        matches.push({
+          path: relativePath,
+          line: lineNumber,
+          text: line
+        });
+        if (matches.length >= maxResults) {
+          rl.close();
+          stream.destroy();
+          break;
+        }
+      }
+    }
+  }
+  
+  await search(targetDir);
+  return matches;
+}
+
 // Define tools list with annotations
 const TOOLS = [
   {
     name: "read_file",
-    description: "Read the contents of a file as UTF-8 text from the workspace.",
+    description: "Read the contents of a file as UTF-8 text from the workspace. Supports start_line and end_line parameters.",
     inputSchema: {
       type: "object",
       properties: {
         path: {
           type: "string",
           description: "Path to the file to read, relative to workspace root"
+        },
+        start_line: {
+          type: "number",
+          description: "Optional 1-based start line to read from"
+        },
+        end_line: {
+          type: "number",
+          description: "Optional 1-based end line to read to (inclusive)"
         }
       },
       required: ["path"]
@@ -430,6 +622,35 @@ const TOOLS = [
         path: {
           type: "string",
           description: "Optional subdirectory path to search within, relative to workspace root"
+        }
+      },
+      required: ["pattern"]
+    },
+    annotations: {
+      readOnlyHint: true
+    }
+  },
+  {
+    name: "grep_content",
+    description: "Search for a fixed string pattern in files within the workspace. Returns only matching lines, capped at max_results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Fixed string pattern to search for in files"
+        },
+        path: {
+          type: "string",
+          description: "Optional subdirectory path to search within, relative to workspace root"
+        },
+        case_sensitive: {
+          type: "boolean",
+          description: "Whether the search should be case-sensitive (defaults to false)"
+        },
+        max_results: {
+          type: "number",
+          description: "Maximum number of results to return (defaults to 50)"
         }
       },
       required: ["pattern"]
@@ -677,7 +898,17 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         };
       }
       
-      const content = await fs.promises.readFile(resolvedPath, "utf-8");
+      let content = await fs.promises.readFile(resolvedPath, "utf-8");
+      
+      const startLine = parsed.data.start_line;
+      const endLine = parsed.data.end_line;
+      if (startLine !== undefined || endLine !== undefined) {
+        const lines = content.split(/\r?\n/);
+        const start = startLine !== undefined ? Math.max(1, startLine) - 1 : 0;
+        const end = endLine !== undefined ? Math.min(lines.length, endLine) : lines.length;
+        content = lines.slice(start, end).join("\n");
+      }
+      
       return {
         content: [{ type: "text", text: content }]
       };
@@ -730,6 +961,36 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
       const results = await searchFiles(targetDir, parsed.data.pattern);
       return {
         content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
+      };
+    }
+    
+    case "grep_content": {
+      const parsed = GrepContentSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const targetDir = resolveSafePath(workspaceRoot, parsed.data.path || ".");
+      const stat = await fs.promises.stat(targetDir);
+      if (!stat.isDirectory()) {
+        return {
+          content: [{ type: "text", text: `Path "${parsed.data.path || "."}" is not a directory.` }],
+          isError: true
+        };
+      }
+      
+      const pattern = parsed.data.pattern;
+      const caseSensitive = !!parsed.data.case_sensitive;
+      const maxResults = parsed.data.max_results || 50;
+      
+      console.error(`[cli-bridge] Performing grep_content search for pattern "${pattern}" in "${targetDir}" (caseSensitive: ${caseSensitive}, maxResults: ${maxResults})`);
+      
+      const matches = await performGrep(targetDir, pattern, caseSensitive, maxResults);
+      return {
+        content: [{ type: "text", text: JSON.stringify(matches, null, 2) }]
       };
     }
     
