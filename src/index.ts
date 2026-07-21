@@ -32,44 +32,6 @@ console.error(`[cli-bridge] Workspace root set to: ${workspaceRoot}`);
 console.error(`[cli-bridge] Using bundled ripgrep binary: ${rgPath}`);
 
 /**
- * Ensures that WORKSPACE_ROOT/.gitignore exists and contains the required log exclusions.
- */
-function ensureGitignore(root: string) {
-  try {
-    const gitignorePath = path.join(root, ".gitignore");
-    const targets = [".cli-bridge-audit.log", "PROJECT_LOG.md"];
-    
-    if (!fs.existsSync(gitignorePath)) {
-      fs.writeFileSync(gitignorePath, targets.join("\n") + "\n", "utf-8");
-      console.error("[cli-bridge] Created default .gitignore with log exclusions.");
-      return;
-    }
-    
-    const content = fs.readFileSync(gitignorePath, "utf-8");
-    const lines = content.split(/\r?\n/).map(line => line.trim());
-    const toAppend: string[] = [];
-    
-    for (const target of targets) {
-      if (!lines.includes(target)) {
-        toAppend.push(target);
-      }
-    }
-    
-    if (toAppend.length > 0) {
-      const needsLeadingNewline = content.length > 0 && !content.endsWith("\n") && !content.endsWith("\r");
-      const appendStr = (needsLeadingNewline ? "\n" : "") + toAppend.join("\n") + "\n";
-      fs.appendFileSync(gitignorePath, appendStr, "utf-8");
-      console.error(`[cli-bridge] Appended missing entries to .gitignore: ${toAppend.join(", ")}`);
-    }
-  } catch (err: any) {
-    console.error(`[cli-bridge] Warning: Failed to configure .gitignore: ${err.message}`);
-  }
-}
-
-// Run gitignore check on startup
-ensureGitignore(workspaceRoot);
-
-/**
  * Resolves user path relative to workspace root, checks for directory traversal,
  * absolute path escapes, and resolves symlinks securely.
  * Throws an error if the path resolves outside the workspace root.
@@ -109,6 +71,95 @@ export function resolveSafePath(root: string, userPath: string): string {
 
   return realPath;
 }
+
+/**
+ * Determines the top-level project subfolder scope for a path relative to workspaceRoot.
+ * Returns "" if the path is at root level, empty, or outside workspace.
+ */
+export function determineProjectScope(userPath?: string): string {
+  if (!userPath) return "";
+  try {
+    const resolved = resolveSafePath(workspaceRoot, userPath);
+    const relative = path.relative(workspaceRoot, resolved).replace(/\\/g, "/");
+    if (!relative || relative === "." || relative.startsWith("..")) {
+      return "";
+    }
+    const parts = relative.split("/").filter(Boolean);
+    if (parts.length === 0) return "";
+    
+    if (parts.length > 1) {
+      return parts[0];
+    }
+    
+    // parts.length === 1
+    // Check if workspaceRoot/parts[0] is an existing directory
+    const targetPath = path.join(workspaceRoot, parts[0]);
+    try {
+      const stat = fs.statSync(targetPath);
+      if (stat.isDirectory()) {
+        return parts[0];
+      }
+    } catch {
+      // Not a directory or doesn't exist yet
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Returns the target directory for a given project scope.
+ */
+function getScopeDirectory(scope: string): string {
+  if (!scope) return workspaceRoot;
+  try {
+    return resolveSafePath(workspaceRoot, scope);
+  } catch {
+    return workspaceRoot;
+  }
+}
+
+/**
+ * Ensures that targetDir/.gitignore exists and contains the required log exclusions.
+ */
+function ensureGitignore(targetDir: string) {
+  try {
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+    const gitignorePath = path.join(targetDir, ".gitignore");
+    const targets = [".cli-bridge-audit.log", "PROJECT_LOG.md"];
+    
+    if (!fs.existsSync(gitignorePath)) {
+      fs.writeFileSync(gitignorePath, targets.join("\n") + "\n", "utf-8");
+      console.error(`[cli-bridge] Created default .gitignore with log exclusions in: ${targetDir}`);
+      return;
+    }
+    
+    const content = fs.readFileSync(gitignorePath, "utf-8");
+    const lines = content.split(/\r?\n/).map(line => line.trim());
+    const toAppend: string[] = [];
+    
+    for (const target of targets) {
+      if (!lines.includes(target)) {
+        toAppend.push(target);
+      }
+    }
+    
+    if (toAppend.length > 0) {
+      const needsLeadingNewline = content.length > 0 && !content.endsWith("\n") && !content.endsWith("\r");
+      const appendStr = (needsLeadingNewline ? "\n" : "") + toAppend.join("\n") + "\n";
+      fs.appendFileSync(gitignorePath, appendStr, "utf-8");
+      console.error(`[cli-bridge] Appended missing entries to .gitignore in ${targetDir}: ${toAppend.join(", ")}`);
+    }
+  } catch (err: any) {
+    console.error(`[cli-bridge] Warning: Failed to configure .gitignore in ${targetDir}: ${err.message}`);
+  }
+}
+
+// Run gitignore check on workspaceRoot startup
+ensureGitignore(workspaceRoot);
 
 /**
  * Helper to check if a string matches url patterns (skipped by path heuristic scan)
@@ -240,11 +291,13 @@ const ExecuteCommandSchema = z.object({
 const JournalEntrySchema = z.object({
   summary: z.string().describe("Short natural-language description of work completed"),
   files_changed: z.array(z.string()).optional().describe("Optional list of relevant files changed"),
-  commit_hash: z.string().optional().describe("Optional short git commit hash")
+  commit_hash: z.string().optional().describe("Optional short git commit hash"),
+  project: z.string().optional().describe("Optional target project subfolder name (e.g. 'snake-game')")
 });
 
 const GetRecentJournalEntriesSchema = z.object({
-  count: z.number().optional().describe("Number of recent entries to retrieve (defaults to 5)")
+  count: z.number().optional().describe("Number of recent entries to retrieve (defaults to 5)"),
+  project: z.string().optional().describe("Optional target project subfolder name (e.g. 'snake-game')")
 });
 
 const GrepContentSchema = z.object({
@@ -763,6 +816,10 @@ const TOOLS = [
         commit_hash: {
           type: "string",
           description: "Optional git short commit hash"
+        },
+        project: {
+          type: "string",
+          description: "Optional target project subfolder name (e.g. 'snake-game')"
         }
       },
       required: ["summary"]
@@ -782,6 +839,10 @@ const TOOLS = [
         count: {
           type: "number",
           description: "Number of entries to retrieve (defaults to 5)"
+        },
+        project: {
+          type: "string",
+          description: "Optional target project subfolder name (e.g. 'snake-game')"
         }
       }
     },
@@ -812,11 +873,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 /**
- * Appends a JSON structured audit log line to workspaceRoot/.cli-bridge-audit.log
+ * Appends a JSON structured audit log line to targetDir/.cli-bridge-audit.log
  */
-function appendAuditLog(tool: string, args: any, status: string) {
+function appendAuditLog(tool: string, args: any, status: string, scope: string = "") {
   try {
-    const logPath = path.join(workspaceRoot, ".cli-bridge-audit.log");
+    const targetDir = getScopeDirectory(scope);
+    ensureGitignore(targetDir);
+    const logPath = path.join(targetDir, ".cli-bridge-audit.log");
     
     // Create copy of args and truncate content fields if necessary
     const formattedArgs = { ...args };
@@ -847,10 +910,23 @@ function appendAuditLog(tool: string, args: any, status: string) {
 // Register call tool handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolName = request.params.name;
-  const args = request.params.arguments || {};
+  const args: any = request.params.arguments || {};
   
   // Log every tool call to stderr
   console.error(`[cli-bridge] Tool invocation: ${toolName} with args ${JSON.stringify(args)}`);
+  
+  let scope = "";
+  if (toolName === "execute_command") {
+    scope = determineProjectScope(args.cwd);
+  } else if (toolName === "log_journal_entry" || toolName === "get_recent_journal_entries") {
+    if (args.project) {
+      scope = determineProjectScope(args.project) || args.project;
+    } else if (toolName === "log_journal_entry" && Array.isArray(args.files_changed) && args.files_changed.length > 0) {
+      scope = determineProjectScope(args.files_changed[0]);
+    }
+  } else if (args.path) {
+    scope = determineProjectScope(args.path);
+  }
   
   let status = "success";
   try {
@@ -862,10 +938,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         status = "error";
       }
     }
-    appendAuditLog(toolName, args, status);
+    appendAuditLog(toolName, args, status, scope);
     return response;
   } catch (error: any) {
-    appendAuditLog(toolName, args, "error");
+    appendAuditLog(toolName, args, "error", scope);
     console.error(`[cli-bridge] Tool error in ${toolName}: ${error.stack || error.message || error}`);
     return {
       content: [{ type: "text", text: error.message || String(error) }],
@@ -1176,7 +1252,16 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         }
       }
       
-      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      let scope = "";
+      if (parsed.data.project) {
+        scope = determineProjectScope(parsed.data.project) || parsed.data.project;
+      } else if (parsed.data.files_changed && parsed.data.files_changed.length > 0) {
+        scope = determineProjectScope(parsed.data.files_changed[0]);
+      }
+      
+      const targetDir = getScopeDirectory(scope);
+      ensureGitignore(targetDir);
+      const logPath = path.join(targetDir, "PROJECT_LOG.md");
       const timestamp = new Date().toISOString();
       const files = parsed.data.files_changed && parsed.data.files_changed.length > 0
         ? parsed.data.files_changed.join(", ")
@@ -1216,7 +1301,13 @@ This log tracks development history and work continuity.
         };
       }
       
-      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      let scope = "";
+      if (parsed.data.project) {
+        scope = determineProjectScope(parsed.data.project) || parsed.data.project;
+      }
+      
+      const targetDir = getScopeDirectory(scope);
+      const logPath = path.join(targetDir, "PROJECT_LOG.md");
       if (!fs.existsSync(logPath)) {
         return {
           content: [{ type: "text", text: "No project log file found." }]
@@ -1227,7 +1318,6 @@ This log tracks development history and work continuity.
       const content = await fs.promises.readFile(logPath, "utf-8");
       const entries = content.split(/(?:\r?\n)?---(?:\r?\n)?/).map(e => e.trim()).filter(Boolean);
       
-      // Take last N entries
       const lastN = entries.slice(-count);
       const cleanedN = lastN.map(entry => {
         if (entry.includes("# Project Journal")) {

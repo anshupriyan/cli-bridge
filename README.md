@@ -15,13 +15,13 @@
 2. `list_directory(path: string, recursive?: boolean)`
    - Lists the directory contents including names, sizes, and whether each item is a directory.
    - Constrained to the workspace root directory.
-   - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
+   - Excludes `.cli-bridge-audit.log` from directory listings.
    - annotations: `readOnlyHint: true`.
 
 3. `search_files(pattern: string, path?: string)`
    - Recursively searches for files matching a glob pattern (e.g. `*.ts`, `**/*.js`).
    - Constrained to the workspace root directory.
-   - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
+   - Excludes `.cli-bridge-audit.log` from search results.
    - annotations: `readOnlyHint: true`.
 
 4. `grep_content(pattern: string, path?: string, case_sensitive?: boolean, max_results?: number)`
@@ -30,8 +30,9 @@
    - Returns only relative file path, line number, and match text (never full file contents). Capped at `max_results` (default 50).
    - annotations: `readOnlyHint: true`.
 
-5. `get_recent_journal_entries(count?: number)`
+5. `get_recent_journal_entries(count?: number, project?: string)`
    - Reads the last N entries from `PROJECT_LOG.md`.
+   - Supports an optional `project` subfolder parameter (e.g. `'snake-game'`) to read entries specifically for that project.
    - annotations: `readOnlyHint: true`.
 
 ### Write & Execution Tools (Phase 2)
@@ -57,8 +58,9 @@
    - annotations: `readOnlyHint: false, destructiveHint: true, openWorldHint: true`.
    - Logs command, args, and cwd to stderr and the audit log before executing.
 
-9. `log_journal_entry(summary: string, files_changed?: string[], commit_hash?: string)`
+9. `log_journal_entry(summary: string, files_changed?: string[], commit_hash?: string, project?: string)`
    - Appends a structured log entry to `PROJECT_LOG.md` detailing completed work and changed files.
+   - Supports an optional `project` parameter to target a specific project subfolder's journal.
    - annotations: `readOnlyHint: false, destructiveHint: false, idempotentHint: false`.
 
 ---
@@ -81,14 +83,13 @@ The security model of `cli-bridge` relies on the following boundaries:
   > To improve defense-in-depth, `execute_command` also performs a best-effort pre-flight path safety scan for filesystem paths outside the workspace root before running any command, and blocks execution if found. This is a heuristic string-scan, not a hard sandboxing boundary — it will not catch every case (e.g. paths read from environment variables, obfuscated/encoded paths, or non-filesystem risks like network requests to arbitrary hosts).
   >
   > Write and execute tools are annotated with `destructiveHint: true`. This causes Claude Desktop (and other standard MCP clients) to prompt you for confirmation before executing these actions. Do not disable or bypass these prompts, as manual approval of each `execute_command` call remains the primary safeguard.
-- **Audit Logging**:
-  Every tool invocation is logged to an append-only JSON file at `WORKSPACE_ROOT/.cli-bridge-audit.log` for safety verification and tracking. The log records:
+- **Per-Project Subfolder Audit Logging**:
+  `cli-bridge` scopes audit logs (`.cli-bridge-audit.log`) per top-level subfolder within the workspace (e.g., `WORKSPACE_ROOT/snake-game/.cli-bridge-audit.log`), so multiple projects sharing one workspace root do not mix log traces together. Operations at the workspace root (without a subfolder scope) log to `WORKSPACE_ROOT/.cli-bridge-audit.log` as a fallback.
+  The audit log records:
   - Timestamp (ISO format)
   - Tool name invoked
-  - Input arguments (with content fields truncated to 200 characters for `write_file`/`edit_file` to keep the logs readable)
+  - Input arguments (with content fields truncated to 200 characters for `write_file`/`edit_file`)
   - Result status (`success`, `error`, or `blocked`)
-  
-  This audit file is automatically filtered out of `list_directory` and `search_files` results to avoid cluttering the workspace.
 
 ---
 
@@ -105,9 +106,10 @@ To optimize token usage and context window consumption, the following workflows 
 
 ## Project Journal
 
-`cli-bridge` features an append-only human-readable journal located at `WORKSPACE_ROOT/PROJECT_LOG.md`.
+`cli-bridge` features an append-only human-readable journal (`PROJECT_LOG.md`), automatically scoped per top-level project subfolder (e.g., `WORKSPACE_ROOT/snake-game/PROJECT_LOG.md`).
 
 - **Purpose**: It is designed to act as a continuity record for Claude (or other agents) to read at the start of subsequent sessions to understand project status, context, and previous modifications. This is distinct from `.cli-bridge-audit.log`, which is a raw security and execution trace file.
+- **Per-Project Scoping**: Each top-level subfolder maintains its own `PROJECT_LOG.md`. Claude can target a specific project explicitly using the optional `project` parameter on `log_journal_entry` and `get_recent_journal_entries`. Root-level work logs to `WORKSPACE_ROOT/PROJECT_LOG.md` as a fallback.
 - **Expectation of Use**: Claude is expected to invoke `log_journal_entry` autonomously after completing a meaningful chunk of work (not after every single file edit) and whenever explicitly requested by the user.
 - **Git Grounding**: In Git-enabled workspaces, Claude should run query commands (e.g., `git log`, `git diff`, `git show`) via `execute_command` to compile the factual basis of journal logs (such as the commit hash and file lists) rather than relying purely on its internal conversation history.
 
