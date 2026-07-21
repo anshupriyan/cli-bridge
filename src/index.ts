@@ -29,6 +29,44 @@ try {
 console.error(`[cli-bridge] Workspace root set to: ${workspaceRoot}`);
 
 /**
+ * Ensures that WORKSPACE_ROOT/.gitignore exists and contains the required log exclusions.
+ */
+function ensureGitignore(root: string) {
+  try {
+    const gitignorePath = path.join(root, ".gitignore");
+    const targets = [".cli-bridge-audit.log", "PROJECT_LOG.md"];
+    
+    if (!fs.existsSync(gitignorePath)) {
+      fs.writeFileSync(gitignorePath, targets.join("\n") + "\n", "utf-8");
+      console.error("[cli-bridge] Created default .gitignore with log exclusions.");
+      return;
+    }
+    
+    const content = fs.readFileSync(gitignorePath, "utf-8");
+    const lines = content.split(/\r?\n/).map(line => line.trim());
+    const toAppend: string[] = [];
+    
+    for (const target of targets) {
+      if (!lines.includes(target)) {
+        toAppend.push(target);
+      }
+    }
+    
+    if (toAppend.length > 0) {
+      const needsLeadingNewline = content.length > 0 && !content.endsWith("\n") && !content.endsWith("\r");
+      const appendStr = (needsLeadingNewline ? "\n" : "") + toAppend.join("\n") + "\n";
+      fs.appendFileSync(gitignorePath, appendStr, "utf-8");
+      console.error(`[cli-bridge] Appended missing entries to .gitignore: ${toAppend.join(", ")}`);
+    }
+  } catch (err: any) {
+    console.error(`[cli-bridge] Warning: Failed to configure .gitignore: ${err.message}`);
+  }
+}
+
+// Run gitignore check on startup
+ensureGitignore(workspaceRoot);
+
+/**
  * Resolves user path relative to workspace root, checks for directory traversal,
  * absolute path escapes, and resolves symlinks securely.
  * Throws an error if the path resolves outside the workspace root.
@@ -192,6 +230,16 @@ const ExecuteCommandSchema = z.object({
   args: z.array(z.string()).describe("List of command-line arguments to pass"),
   cwd: z.string().optional().describe("Optional working directory relative to workspace root"),
   timeout: z.number().optional().describe("Timeout in milliseconds (defaults to 30000)")
+});
+
+const JournalEntrySchema = z.object({
+  summary: z.string().describe("Short natural-language description of work completed"),
+  files_changed: z.array(z.string()).optional().describe("Optional list of relevant files changed"),
+  commit_hash: z.string().optional().describe("Optional short git commit hash")
+});
+
+const GetRecentJournalEntriesSchema = z.object({
+  count: z.number().optional().describe("Number of recent entries to retrieve (defaults to 5)")
 });
 
 interface DirectoryEntry {
@@ -472,6 +520,52 @@ const TOOLS = [
       readOnlyHint: false,
       destructiveHint: true,
       openWorldHint: true
+    }
+  },
+  {
+    name: "log_journal_entry",
+    description: "Append a structured log entry to PROJECT_LOG.md detailing completed work and changed files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description: "Description of the work done and why (natural language)"
+        },
+        files_changed: {
+          type: "array",
+          items: {
+            type: "string"
+          },
+          description: "Optional list of relevant files changed (relative paths)"
+        },
+        commit_hash: {
+          type: "string",
+          description: "Optional git short commit hash"
+        }
+      },
+      required: ["summary"]
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false
+    }
+  },
+  {
+    name: "get_recent_journal_entries",
+    description: "Read the last N entries from PROJECT_LOG.md.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        count: {
+          type: "number",
+          description: "Number of entries to retrieve (defaults to 5)"
+        }
+      }
+    },
+    annotations: {
+      readOnlyHint: true
     }
   }
 ];
@@ -803,6 +897,91 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
           }
         });
       });
+    }
+    
+    case "log_journal_entry": {
+      const parsed = JournalEntrySchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      // Validate files_changed relative paths if provided
+      if (parsed.data.files_changed) {
+        for (const file of parsed.data.files_changed) {
+          resolveSafePath(workspaceRoot, file);
+        }
+      }
+      
+      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      const timestamp = new Date().toISOString();
+      const files = parsed.data.files_changed && parsed.data.files_changed.length > 0
+        ? parsed.data.files_changed.join(", ")
+        : "none specified";
+      const commit = parsed.data.commit_hash || "not committed";
+      
+      const entry = `## ${timestamp}
+**Summary:** ${parsed.data.summary}
+**Files:** ${files}
+**Commit:** ${commit}
+
+---
+`;
+      
+      if (!fs.existsSync(logPath)) {
+        const header = `# Project Journal
+
+This log tracks development history and work continuity.
+
+`;
+        await fs.promises.writeFile(logPath, header + entry, "utf-8");
+      } else {
+        await fs.promises.appendFile(logPath, "\n" + entry, "utf-8");
+      }
+      
+      return {
+        content: [{ type: "text", text: `Successfully logged journal entry.` }]
+      };
+    }
+    
+    case "get_recent_journal_entries": {
+      const parsed = GetRecentJournalEntriesSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      if (!fs.existsSync(logPath)) {
+        return {
+          content: [{ type: "text", text: "No project log file found." }]
+        };
+      }
+      
+      const count = parsed.data.count || 5;
+      const content = await fs.promises.readFile(logPath, "utf-8");
+      const entries = content.split(/(?:\r?\n)?---(?:\r?\n)?/).map(e => e.trim()).filter(Boolean);
+      
+      // Take last N entries
+      const lastN = entries.slice(-count);
+      const cleanedN = lastN.map(entry => {
+        if (entry.includes("# Project Journal")) {
+          const index = entry.indexOf("## ");
+          if (index !== -1) {
+            return entry.substring(index);
+          }
+        }
+        return entry;
+      });
+      
+      const resultText = cleanedN.join("\n\n---\n\n");
+      return {
+        content: [{ type: "text", text: resultText }]
+      };
     }
     
     default:

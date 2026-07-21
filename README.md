@@ -23,28 +23,36 @@
    - Excludes the audit log file (`.cli-bridge-audit.log`) by default.
    - annotations: `readOnlyHint: true`.
 
+4. `get_recent_journal_entries(count?: number)`
+   - Reads the last N entries from `PROJECT_LOG.md`.
+   - annotations: `readOnlyHint: true`.
+
 ### Write & Execution Tools (Phase 2)
 
-4. `write_file(path: string, content: string)`
+5. `write_file(path: string, content: string)`
    - Full file overwrite (creates or replaces files). Automatically creates parent directories if needed.
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
    - Logs resolved path and content length to stderr and the audit log.
 
-5. `edit_file(path: string, old_str: string, new_str: string)`
+6. `edit_file(path: string, old_str: string, new_str: string)`
    - Performs find-and-replace on a unique string inside a file.
    - Errors if `old_str` matches zero times or more than once in the file (ambiguous edits are rejected).
      - *Note: `old_str` must appear exactly once in the file — this is intentionally strict to prevent ambiguous edits, but means `edit_file` will fail on files with repeated boilerplate or whitespace-sensitive matches. If this happens, fall back to `write_file` with the full new content.*
    - Constrained to the workspace root directory.
    - annotations: `readOnlyHint: false, destructiveHint: true, idempotentHint: true`.
 
-6. `execute_command(command: string, args: string[], cwd?: string, timeout?: number)`
+7. `execute_command(command: string, args: string[], cwd?: string, timeout?: number)`
    - Spawns a process directly using Node's `child_process.spawn`.
    - Uses `shell: false` by default. On Windows, conditional `shell: true` is allowed ONLY for an allowlist of known package manager/build script wrappers (`npm`, `npx`, `yarn`, `pnpm`, `tsc`, `jest`, `eslint`, `prettier`).
    - `cwd` is validated to reside inside the workspace root; defaults to workspace root if not provided.
    - Automatically kills the command and returns a timeout error if execution exceeds the timeout (defaults to 30 seconds).
    - annotations: `readOnlyHint: false, destructiveHint: true, openWorldHint: true`.
    - Logs command, args, and cwd to stderr and the audit log before executing.
+
+8. `log_journal_entry(summary: string, files_changed?: string[], commit_hash?: string)`
+   - Appends a structured log entry to `PROJECT_LOG.md` detailing completed work and changed files.
+   - annotations: `readOnlyHint: false, destructiveHint: false, idempotentHint: false`.
 
 ---
 
@@ -74,6 +82,16 @@ The security model of `cli-bridge` relies on the following boundaries:
   - Result status (`success`, `error`, or `blocked`)
   
   This audit file is automatically filtered out of `list_directory` and `search_files` results to avoid cluttering the workspace.
+
+---
+
+## Project Journal
+
+`cli-bridge` features an append-only human-readable journal located at `WORKSPACE_ROOT/PROJECT_LOG.md`.
+
+- **Purpose**: It is designed to act as a continuity record for Claude (or other agents) to read at the start of subsequent sessions to understand project status, context, and previous modifications. This is distinct from `.cli-bridge-audit.log`, which is a raw security and execution trace file.
+- **Expectation of Use**: Claude is expected to invoke `log_journal_entry` autonomously after completing a meaningful chunk of work (not after every single file edit) and whenever explicitly requested by the user.
+- **Git Grounding**: In Git-enabled workspaces, Claude should run query commands (e.g., `git log`, `git diff`, `git show`) via `execute_command` to compile the factual basis of journal logs (such as the commit hash and file lists) rather than relying purely on its internal conversation history.
 
 ---
 
