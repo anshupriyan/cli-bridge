@@ -130,15 +130,24 @@ To optimize context window usage when working with AI coding assistants:
 
 ## Installation and Setup
 
-### Prerequisites
-- Node.js (v18.17.0+)
+### Prerequisites for a Fresh Machine
+- **Node.js (v18.17.0+)**: Required to run the server runtime and package manager (`node` and `npm`). Recommended: Node.js v20 LTS or v24 LTS.
+- **Git** (Optional): Recommended if you intend to run Git commands (`git diff`, `git log`, `git show`) via `execute_command` in Dev Mode.
 
-### Build Steps
-1. Install dependencies:
+> [!NOTE]
+> **No System Ripgrep Installation Required**: You do **NOT** need to install `ripgrep` (`rg`) separately on your operating system. Running `npm install` automatically downloads the correct prebuilt binary (`rg.exe` on Windows, `rg` on macOS/Linux) for your OS architecture via `@vscode/ripgrep`.
+
+### Setup & Build Steps
+1. **Clone or download the repository**:
+   ```bash
+   git clone https://github.com/anshupriyan/cli-bridge.git
+   cd cli-bridge
+   ```
+2. **Install dependencies**:
    ```bash
    npm install
    ```
-2. Build the project:
+3. **Build the TypeScript binary**:
    ```bash
    npm run build
    ```
