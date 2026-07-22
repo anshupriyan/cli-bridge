@@ -2,3 +2,6 @@ node_modules/
 build/
 .DS_Store
 *.log
+
+.cli-bridge-audit.log
+PROJECT_LOG.md
