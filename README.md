@@ -164,18 +164,19 @@ Add `cli-bridge` to your Claude Desktop configuration file (typically `%APPDATA%
     "cli-bridge": {
       "command": "node",
       "args": [
-        "c:/Projects/cli-bridge/build/index.js",
-        "c:/Projects/cli-bridge"
+        "<YOUR_DEFAULT_INSTALLATION_PATH>/build/index.js",
+        "<YOUR_DEFAULT_WORKSPACE_PATH>"
       ],
       "env": {
-        "WORKSPACE_ROOT": "c:/Projects/cli-bridge"
+        "WORKSPACE_ROOT": "<YOUR_DEFAULT_WORKSPACE_PATH>"
       }
     }
   }
 }
 ```
 
-*Note: Replace `c:/Projects/cli-bridge` with your actual server installation path and target workspace folder.*
+- Replace `<YOUR_DEFAULT_INSTALLATION_PATH>` with the folder where you cloned `cli-bridge` (e.g. `C:/Projects/cli-bridge` on Windows or `/Users/username/Projects/cli-bridge` on macOS/Linux).
+- Replace `<YOUR_DEFAULT_WORKSPACE_PATH>` with the target project workspace folder you want `cli-bridge` to manage.
 
 ---
 
@@ -184,5 +185,5 @@ Add `cli-bridge` to your Claude Desktop configuration file (typically `%APPDATA%
 Test the server locally using `@modelcontextprotocol/inspector`:
 
 ```bash
-npx @modelcontextprotocol/inspector node build/index.js c:/Projects/cli-bridge
+npx @modelcontextprotocol/inspector node build/index.js <YOUR_DEFAULT_WORKSPACE_PATH>
 ```
