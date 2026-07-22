@@ -130,24 +130,15 @@ To optimize context window usage when working with AI coding assistants:
 
 ## Installation and Setup
 
-### Prerequisites for a Fresh Machine
-- **Node.js (v18.17.0+)**: Required to run the server runtime and package manager (`node` and `npm`). Recommended: Node.js v20 LTS or v24 LTS.
-- **Git** (Optional): Recommended if you intend to run Git commands (`git diff`, `git log`, `git show`) via `execute_command` in Dev Mode.
+### Prerequisites
+- Node.js (v18.17.0+)
 
-> [!NOTE]
-> **No System Ripgrep Installation Required**: You do **NOT** need to install `ripgrep` (`rg`) separately on your operating system. Running `npm install` automatically downloads the correct prebuilt binary (`rg.exe` on Windows, `rg` on macOS/Linux) for your OS architecture via `@vscode/ripgrep`.
-
-### Setup & Build Steps
-1. **Clone or download the repository**:
-   ```bash
-   git clone https://github.com/anshupriyan/cli-bridge.git
-   cd cli-bridge
-   ```
-2. **Install dependencies**:
+### Build Steps
+1. Install dependencies:
    ```bash
    npm install
    ```
-3. **Build the TypeScript binary**:
+2. Build the project:
    ```bash
    npm run build
    ```
@@ -156,24 +147,7 @@ To optimize context window usage when working with AI coding assistants:
 
 ## Configuration in Claude Desktop
 
-### Finding your config file (Windows)
-
-Depending on how Claude Desktop was installed (standard installer vs. MSIX/Microsoft Store package), its configuration file location differs. You can run this PowerShell command to locate your `claude_desktop_config.json` automatically:
-
-```powershell
-Get-ChildItem -Path "$env:APPDATA\Claude\claude_desktop_config.json", "$env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json" -ErrorAction SilentlyContinue | Select-Object FullName
-```
-
-> [!NOTE]
-> If neither path returns a result, the configuration file has likely not been created yet (which happens after opening Claude Desktop for the first time) or is installed in a non-standard location.
-
-#### Manual File Paths Reference
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json` (or `%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\Claude\claude_desktop_config.json` for Store/MSIX installs)
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-
-### Registering cli-bridge
-
-Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.json`:
+Add `cli-bridge` to your Claude Desktop configuration file (typically `%APPDATA%\Claude\claude_desktop_config.json` on Windows or `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
@@ -181,19 +155,18 @@ Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.j
     "cli-bridge": {
       "command": "node",
       "args": [
-        "<YOUR_DEFAULT_INSTALLATION_PATH>/build/index.js",
-        "<YOUR_DEFAULT_WORKSPACE_PATH>"
+        "c:/Projects/cli-bridge/build/index.js",
+        "c:/Projects/cli-bridge"
       ],
       "env": {
-        "WORKSPACE_ROOT": "<YOUR_DEFAULT_WORKSPACE_PATH>"
+        "WORKSPACE_ROOT": "c:/Projects/cli-bridge"
       }
     }
   }
 }
 ```
 
-- Replace `<YOUR_DEFAULT_INSTALLATION_PATH>` with the folder where you cloned `cli-bridge` (e.g. `C:/Projects/cli-bridge` on Windows or `/Users/username/Projects/cli-bridge` on macOS/Linux).
-- Replace `<YOUR_DEFAULT_WORKSPACE_PATH>` with the target project workspace folder you want `cli-bridge` to manage.
+*Note: Replace `c:/Projects/cli-bridge` with your actual server installation path and target workspace folder.*
 
 ---
 
@@ -202,5 +175,5 @@ Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.j
 Test the server locally using `@modelcontextprotocol/inspector`:
 
 ```bash
-npx @modelcontextprotocol/inspector node build/index.js <YOUR_DEFAULT_WORKSPACE_PATH>
+npx @modelcontextprotocol/inspector node build/index.js c:/Projects/cli-bridge
 ```
