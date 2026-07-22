@@ -11,6 +11,9 @@ import { spawn } from "child_process";
 import * as readline from "readline";
 import { rgPath } from "@vscode/ripgrep";
 
+// In-memory Dev Mode state for shell execution (defaults to false on server startup)
+let devModeEnabled = false;
+
 // Initialize workspace root
 const workspaceRootEnv = process.env.WORKSPACE_ROOT;
 const workspaceRootArg = process.argv[2];
@@ -30,6 +33,7 @@ try {
 
 console.error(`[cli-bridge] Workspace root set to: ${workspaceRoot}`);
 console.error(`[cli-bridge] Using bundled ripgrep binary: ${rgPath}`);
+console.error(`[cli-bridge] Dev Mode initialized: ${devModeEnabled ? "ON (shell execution ENABLED)" : "OFF (shell execution BLOCKED)"}`);
 
 /**
  * Resolves user path relative to workspace root, checks for directory traversal,
@@ -121,19 +125,19 @@ function getScopeDirectory(scope: string): string {
 }
 
 /**
- * Ensures that targetDir/.gitignore exists and contains the required log exclusions.
+ * Ensures that workspaceRoot/.gitignore exists and contains the required log exclusions.
  */
-function ensureGitignore(targetDir: string) {
+function ensureGitignore() {
   try {
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
+    if (!fs.existsSync(workspaceRoot)) {
+      fs.mkdirSync(workspaceRoot, { recursive: true });
     }
-    const gitignorePath = path.join(targetDir, ".gitignore");
+    const gitignorePath = path.join(workspaceRoot, ".gitignore");
     const targets = [".cli-bridge-audit.log", "PROJECT_LOG.md"];
     
     if (!fs.existsSync(gitignorePath)) {
       fs.writeFileSync(gitignorePath, targets.join("\n") + "\n", "utf-8");
-      console.error(`[cli-bridge] Created default .gitignore with log exclusions in: ${targetDir}`);
+      console.error(`[cli-bridge] Created default .gitignore with log exclusions in: ${workspaceRoot}`);
       return;
     }
     
@@ -151,15 +155,15 @@ function ensureGitignore(targetDir: string) {
       const needsLeadingNewline = content.length > 0 && !content.endsWith("\n") && !content.endsWith("\r");
       const appendStr = (needsLeadingNewline ? "\n" : "") + toAppend.join("\n") + "\n";
       fs.appendFileSync(gitignorePath, appendStr, "utf-8");
-      console.error(`[cli-bridge] Appended missing entries to .gitignore in ${targetDir}: ${toAppend.join(", ")}`);
+      console.error(`[cli-bridge] Appended missing entries to .gitignore in ${workspaceRoot}: ${toAppend.join(", ")}`);
     }
   } catch (err: any) {
-    console.error(`[cli-bridge] Warning: Failed to configure .gitignore in ${targetDir}: ${err.message}`);
+    console.error(`[cli-bridge] Warning: Failed to configure .gitignore in ${workspaceRoot}: ${err.message}`);
   }
 }
 
 // Run gitignore check on workspaceRoot startup
-ensureGitignore(workspaceRoot);
+ensureGitignore();
 
 /**
  * Helper to check if a string matches url patterns (skipped by path heuristic scan)
@@ -306,6 +310,12 @@ const GrepContentSchema = z.object({
   case_sensitive: z.boolean().optional().describe("Whether the search should be case-sensitive (defaults to false)"),
   max_results: z.number().optional().describe("Maximum number of results to return (defaults to 50)")
 });
+
+const ToggleDevModeSchema = z.object({
+  enable_dev_mode: z.boolean().describe("Set to true to enable Dev Mode and allow shell execution, or false to disable Dev Mode and block shell execution.")
+});
+
+const GetDevModeStatusSchema = z.object({});
 
 interface DirectoryEntry {
   name: string;
@@ -764,7 +774,7 @@ const TOOLS = [
   },
   {
     name: "execute_command",
-    description: "Execute a command-line tool in the workspace. Timeout defaults to 30s. Spawns directly without a shell wrapper by default, but supports allowlisted wrappers on Windows.",
+    description: "Execute a command-line tool in the workspace. Gated by Dev Mode (OFF by default; must be enabled via toggle_dev_mode before executing commands). Timeout defaults to 30s. Spawns directly without a shell wrapper by default, but supports allowlisted wrappers on Windows.",
     inputSchema: {
       type: "object",
       properties: {
@@ -797,6 +807,36 @@ const TOOLS = [
     }
   },
   {
+    name: "toggle_dev_mode",
+    description: "Toggle session-only Dev Mode. Setting enable_dev_mode: true enables Dev Mode and permits shell command execution until server restart or turned off. Resets to Dev Mode OFF on every server restart.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        enable_dev_mode: {
+          type: "boolean",
+          description: "Set to true to enable Dev Mode and allow shell execution, or false to disable Dev Mode."
+        }
+      },
+      required: ["enable_dev_mode"]
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false
+    }
+  },
+  {
+    name: "get_dev_mode_status",
+    description: "Get current Dev Mode status for shell command execution. State is in-memory and resets to Dev Mode OFF on every server restart.",
+    inputSchema: {
+      type: "object",
+      properties: {}
+    },
+    annotations: {
+      readOnlyHint: true
+    }
+  },
+  {
     name: "log_journal_entry",
     description: "Append a structured log entry to PROJECT_LOG.md detailing completed work and changed files.",
     inputSchema: {
@@ -815,7 +855,7 @@ const TOOLS = [
         },
         commit_hash: {
           type: "string",
-          description: "Optional git short commit hash"
+          description: "Optional short git commit hash"
         },
         project: {
           type: "string",
@@ -838,7 +878,7 @@ const TOOLS = [
       properties: {
         count: {
           type: "number",
-          description: "Number of entries to retrieve (defaults to 5)"
+          description: "Number of recent entries to retrieve (defaults to 5)"
         },
         project: {
           type: "string",
@@ -873,13 +913,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 /**
- * Appends a JSON structured audit log line to targetDir/.cli-bridge-audit.log
+ * Appends a JSON structured audit log line directly to workspaceRoot/.cli-bridge-audit.log
  */
-function appendAuditLog(tool: string, args: any, status: string, scope: string = "") {
+function appendAuditLog(tool: string, args: any, status: string) {
   try {
-    const targetDir = getScopeDirectory(scope);
-    ensureGitignore(targetDir);
-    const logPath = path.join(targetDir, ".cli-bridge-audit.log");
+    ensureGitignore();
+    const logPath = path.join(workspaceRoot, ".cli-bridge-audit.log");
     
     // Create copy of args and truncate content fields if necessary
     const formattedArgs = { ...args };
@@ -915,33 +954,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Log every tool call to stderr
   console.error(`[cli-bridge] Tool invocation: ${toolName} with args ${JSON.stringify(args)}`);
   
-  let scope = "";
-  if (toolName === "execute_command") {
-    scope = determineProjectScope(args.cwd);
-  } else if (toolName === "log_journal_entry" || toolName === "get_recent_journal_entries") {
-    if (args.project) {
-      scope = determineProjectScope(args.project) || args.project;
-    } else if (toolName === "log_journal_entry" && Array.isArray(args.files_changed) && args.files_changed.length > 0) {
-      scope = determineProjectScope(args.files_changed[0]);
-    }
-  } else if (args.path) {
-    scope = determineProjectScope(args.path);
-  }
-  
   let status = "success";
   try {
     const response = await handleToolCall(toolName, args);
     if (response.isError) {
-      if (response.content && response.content[0] && response.content[0].text && response.content[0].text.includes("Blocked:")) {
+      if (response.content && response.content[0] && response.content[0].text && (response.content[0].text.includes("Blocked:") || response.content[0].text.toLowerCase().includes("blocked"))) {
         status = "blocked";
       } else {
         status = "error";
       }
     }
-    appendAuditLog(toolName, args, status, scope);
+    appendAuditLog(toolName, args, status);
     return response;
   } catch (error: any) {
-    appendAuditLog(toolName, args, "error", scope);
+    appendAuditLog(toolName, args, "error");
     console.error(`[cli-bridge] Tool error in ${toolName}: ${error.stack || error.message || error}`);
     return {
       content: [{ type: "text", text: error.message || String(error) }],
@@ -955,6 +981,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  */
 async function handleToolCall(toolName: string, args: any): Promise<any> {
   switch (toolName) {
+    case "toggle_dev_mode": {
+      const parsed = ToggleDevModeSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+      
+      devModeEnabled = parsed.data.enable_dev_mode;
+      const message = parsed.data.enable_dev_mode
+        ? "Dev Mode is now ON. Shell command execution is enabled until you turn it off or restart the server."
+        : "Dev Mode is now OFF. Shell command execution is blocked.";
+        
+      console.error(`[cli-bridge] ${message}`);
+      return {
+        content: [{ type: "text", text: message }]
+      };
+    }
+
+    case "get_dev_mode_status": {
+      const message = devModeEnabled
+        ? "Dev Mode is currently ON (shell command execution is ENABLED)."
+        : "Dev Mode is currently OFF (shell command execution is BLOCKED).";
+      return {
+        content: [{ type: "text", text: message }]
+      };
+    }
+
     case "read_file": {
       const parsed = ReadFileSchema.safeParse(args);
       if (!parsed.success) {
@@ -1143,6 +1198,16 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
     }
     
     case "execute_command": {
+      // Hard early return if Dev Mode is not enabled before any path/cwd resolution or spawn logic
+      if (!devModeEnabled) {
+        const blockedMsg = "Shell execution is currently blocked. Ask the user if they'd like you to call toggle_dev_mode with enable_dev_mode: true before proceeding.";
+        console.error(`[cli-bridge] ${blockedMsg}`);
+        return {
+          content: [{ type: "text", text: blockedMsg }],
+          isError: true
+        };
+      }
+
       const parsed = ExecuteCommandSchema.safeParse(args);
       if (!parsed.success) {
         return {
@@ -1252,16 +1317,8 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         }
       }
       
-      let scope = "";
-      if (parsed.data.project) {
-        scope = determineProjectScope(parsed.data.project) || parsed.data.project;
-      } else if (parsed.data.files_changed && parsed.data.files_changed.length > 0) {
-        scope = determineProjectScope(parsed.data.files_changed[0]);
-      }
-      
-      const targetDir = getScopeDirectory(scope);
-      ensureGitignore(targetDir);
-      const logPath = path.join(targetDir, "PROJECT_LOG.md");
+      ensureGitignore();
+      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
       const timestamp = new Date().toISOString();
       const files = parsed.data.files_changed && parsed.data.files_changed.length > 0
         ? parsed.data.files_changed.join(", ")
@@ -1301,13 +1358,7 @@ This log tracks development history and work continuity.
         };
       }
       
-      let scope = "";
-      if (parsed.data.project) {
-        scope = determineProjectScope(parsed.data.project) || parsed.data.project;
-      }
-      
-      const targetDir = getScopeDirectory(scope);
-      const logPath = path.join(targetDir, "PROJECT_LOG.md");
+      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
       if (!fs.existsSync(logPath)) {
         return {
           content: [{ type: "text", text: "No project log file found." }]
