@@ -156,7 +156,24 @@ To optimize context window usage when working with AI coding assistants:
 
 ## Configuration in Claude Desktop
 
-Add `cli-bridge` to your Claude Desktop configuration file (typically `%APPDATA%\Claude\claude_desktop_config.json` on Windows or `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+### Finding your config file (Windows)
+
+Depending on how Claude Desktop was installed (standard installer vs. MSIX/Microsoft Store package), its configuration file location differs. You can run this PowerShell command to locate your `claude_desktop_config.json` automatically:
+
+```powershell
+Get-ChildItem -Path "$env:APPDATA\Claude\claude_desktop_config.json", "$env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json" -ErrorAction SilentlyContinue | Select-Object FullName
+```
+
+> [!NOTE]
+> If neither path returns a result, the configuration file has likely not been created yet (which happens after opening Claude Desktop for the first time) or is installed in a non-standard location.
+
+#### Manual File Paths Reference
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json` (or `%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\Claude\claude_desktop_config.json` for Store/MSIX installs)
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+### Registering cli-bridge
+
+Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.json`:
 
 ```json
 {
