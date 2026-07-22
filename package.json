@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "MCP server providing constrained workspace file access and shell execution",
   "type": "module",
+  "license": "MIT",
   "main": "build/index.js",
   "scripts": {
     "build": "tsc",
