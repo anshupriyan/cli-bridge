@@ -8,8 +8,7 @@
 
 | Version | Supported |
 |---|---|
-| 1.0.x | ✅ Yes |
-| < 1.0.0 | ❌ No |
+| 0.0.x / 0.0.1+ | ✅ Yes |
 
 ---
 
@@ -36,7 +35,8 @@ If you discover a security vulnerability (such as a path traversal bypass, symli
 
 ---
 
-## Security Model & Scope Notes
+## Security Model, User Responsibility & Scope Notes
 
-- **Dev Mode & `execute_command`**: When Dev Mode is enabled (`toggle_dev_mode({ enable_dev_mode: true })`), `execute_command` intentionally runs shell commands with host user privileges. Arbitrary command execution while Dev Mode is explicitly ON is intended functionality, not a vulnerability.
-- **In-Scope Boundaries**: Bugs that allow reading/writing files outside the workspace root without Dev Mode, escaping symlinks, or executing shell commands while Dev Mode is OFF are considered high-priority security issues.
+- **Dev Mode & User Responsibility**: When Dev Mode is enabled (`toggle_dev_mode({ enable_dev_mode: true })`), `execute_command` runs real shell commands with host user privileges. As stated in the README, **any data loss, system damage, security incident, or unhandled command side effect resulting from enabling Dev Mode is entirely the user's responsibility.**
+- **In-Scope Vulnerabilities**: Bugs that allow reading or writing files outside the workspace root without Dev Mode, escaping symlinks, or executing shell commands while Dev Mode is OFF are considered critical security vulnerabilities.
+- **Feedback & Future Safety Improvements**: Reporting feedback, edge cases, or ideas regarding Dev Mode safety enhancements and execution guardrails is always open. Suggestions for improving shell safety are welcomed and will be considered for future versions.
