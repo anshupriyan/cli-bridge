@@ -168,6 +168,8 @@ Get-ChildItem -Path "$env:APPDATA\Claude\claude_desktop_config.json", "$env:LOCA
 
 ### Registering cli-bridge
 
+#### Claude Desktop
+
 Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.json`:
 
 ```json
@@ -176,19 +178,55 @@ Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.j
     "cli-bridge": {
       "command": "node",
       "args": [
-        "<YOUR_DEFAULT_INSTALLATION_PATH>/build/index.js",
-        "<YOUR_DEFAULT_WORKSPACE_PATH>"
+        "C:/Projects/cli-bridge/build/index.js",
+        "C:/Projects/my-workspace"
       ],
       "env": {
-        "WORKSPACE_ROOT": "<YOUR_DEFAULT_WORKSPACE_PATH>"
+        "WORKSPACE_ROOT": "C:/Projects/my-workspace"
       }
     }
   }
 }
 ```
 
-- Replace `<YOUR_DEFAULT_INSTALLATION_PATH>` with the folder where you cloned `cli-bridge` (e.g. `C:/Projects/cli-bridge` on Windows or `/Users/username/Projects/cli-bridge` on macOS/Linux).
-- Replace `<YOUR_DEFAULT_WORKSPACE_PATH>` with the target project workspace folder you want `cli-bridge` to manage.
+#### Qwen Studio
+
+Add `cli-bridge` to the `mcpServers` object in your Qwen Studio configuration:
+
+```json
+{
+  "mcpServers": {
+    "cli-bridge": {
+      "command": "npx",
+      "args": [
+        "node",
+        "C:/Projects/cli-bridge/build/index.js",
+        "C:/your_workspace_location"
+      ],
+      "env": {
+        "WORKSPACE_ROOT": "C:/your_workspace_location"
+      }
+    }
+  }
+}
+```
+
+> [!IMPORTANT]
+> **Windows Path Formatting in JSON**:
+> Because `claude_desktop_config.json` is a standard JSON file, single backslashes copied directly from File Explorer's address bar (e.g. `C:\Projects\cli-bridge`) will cause JSON parsing errors unless escaped.
+> 
+> You have two valid options for Windows paths:
+> 1. **Double Backslashes**: `"C:\\Projects\\cli-bridge\\build\\index.js"`
+> 2. **Forward Slashes (Recommended)**: `"C:/Projects/cli-bridge/build/index.js"` (works natively in Node.js on Windows and is easier to type)
+> 
+> | Format | Example Path | Status |
+> |---|---|---|
+> | ❌ Single Backslash | `"C:\Projects\cli-bridge"` | **Fails JSON Parsing** |
+> | ✅ Double Backslash | `"C:\\Projects\\cli-bridge"` | **Valid JSON** |
+> | ✅ Forward Slash | `"C:/Projects/cli-bridge"` | **Valid & Recommended** |
+
+- Replace `C:/Projects/cli-bridge` with the folder where you cloned `cli-bridge`.
+- Replace `C:/Projects/my-workspace` with the target project workspace folder you want `cli-bridge` to manage.
 
 ---
 

@@ -1,8 +1,11 @@
+#!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListPromptsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as fs from "fs";
@@ -58,11 +61,25 @@ export function resolveSafePath(root: string, userPath: string): string {
     // resolve the realpath of the parent directory instead and join the basename.
     const parentDir = path.dirname(resolvedPath);
     const filename = path.basename(resolvedPath);
+    // 1. Positively resolve the parent directory (deny if parent directory cannot be verified)
     try {
       const realParent = fs.realpathSync(parentDir);
       realPath = path.resolve(realParent, filename);
     } catch (parentErr) {
-      // Fall back to resolvedPath if parent directory doesn't exist
+      throw new Error(`Access denied: Unable to verify parent directory for path "${userPath}".`);
+    }
+
+    // 2. Reject if the entry itself is a symlink (dangling symlink escape prevention)
+    // Note: A microsecond TOCTOU window exists between this check and write_file in multi-user environments
+    try {
+      const stat = fs.lstatSync(realPath);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Access denied: Path "${userPath}" resolves outside of workspace root "${realRoot}".`);
+      }
+    } catch (lstatErr: any) {
+      if (lstatErr.code !== "ENOENT") {
+        throw lstatErr;
+      }
     }
   }
 
@@ -125,19 +142,20 @@ function getScopeDirectory(scope: string): string {
 }
 
 /**
- * Ensures that workspaceRoot/.gitignore exists and contains the required log exclusions.
+ * Ensures that the target directory (workspaceRoot or a project subfolder) contains a .gitignore
+ * with log exclusions (.cli-bridge-audit.log and PROJECT_LOG.md).
  */
-function ensureGitignore() {
+function ensureGitignore(targetDir: string = workspaceRoot) {
   try {
-    if (!fs.existsSync(workspaceRoot)) {
-      fs.mkdirSync(workspaceRoot, { recursive: true });
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
     }
-    const gitignorePath = path.join(workspaceRoot, ".gitignore");
+    const gitignorePath = path.join(targetDir, ".gitignore");
     const targets = [".cli-bridge-audit.log", "PROJECT_LOG.md"];
     
     if (!fs.existsSync(gitignorePath)) {
       fs.writeFileSync(gitignorePath, targets.join("\n") + "\n", "utf-8");
-      console.error(`[cli-bridge] Created default .gitignore with log exclusions in: ${workspaceRoot}`);
+      console.error(`[cli-bridge] Created default .gitignore with log exclusions in: ${targetDir}`);
       return;
     }
     
@@ -155,10 +173,10 @@ function ensureGitignore() {
       const needsLeadingNewline = content.length > 0 && !content.endsWith("\n") && !content.endsWith("\r");
       const appendStr = (needsLeadingNewline ? "\n" : "") + toAppend.join("\n") + "\n";
       fs.appendFileSync(gitignorePath, appendStr, "utf-8");
-      console.error(`[cli-bridge] Appended missing entries to .gitignore in ${workspaceRoot}: ${toAppend.join(", ")}`);
+      console.error(`[cli-bridge] Appended missing entries to .gitignore in ${targetDir}: ${toAppend.join(", ")}`);
     }
   } catch (err: any) {
-    console.error(`[cli-bridge] Warning: Failed to configure .gitignore in ${workspaceRoot}: ${err.message}`);
+    console.error(`[cli-bridge] Warning: Failed to configure .gitignore in ${targetDir}: ${err.message}`);
   }
 }
 
@@ -900,7 +918,9 @@ const server = new Server(
   },
   {
     capabilities: {
-      tools: {}
+      tools: {},
+      resources: {},
+      prompts: {}
     }
   }
 );
@@ -912,13 +932,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  return {
+    resources: []
+  };
+});
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => {
+  return {
+    prompts: []
+  };
+});
+
 /**
- * Appends a JSON structured audit log line directly to workspaceRoot/.cli-bridge-audit.log
+ * Appends a JSON structured audit log line directly to the target project's or root's .cli-bridge-audit.log
  */
 function appendAuditLog(tool: string, args: any, status: string) {
   try {
-    ensureGitignore();
-    const logPath = path.join(workspaceRoot, ".cli-bridge-audit.log");
+    let targetPathArg = "";
+    if (args) {
+      if (typeof args.path === "string") {
+        targetPathArg = args.path;
+      } else if (typeof args.cwd === "string") {
+        targetPathArg = args.cwd;
+      } else if (typeof args.project === "string") {
+        targetPathArg = args.project;
+      }
+    }
+
+    const scope = determineProjectScope(targetPathArg);
+    const targetDir = getScopeDirectory(scope);
+
+    ensureGitignore(targetDir);
+    
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+    const logPath = path.join(targetDir, ".cli-bridge-audit.log");
     
     // Create copy of args and truncate content fields if necessary
     const formattedArgs = { ...args };
@@ -1310,15 +1360,28 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
         };
       }
       
+      // Determine target log directory based on project parameter
+      let targetDir = workspaceRoot;
+      if (parsed.data.project && parsed.data.project.trim() !== "") {
+        try {
+          targetDir = resolveSafePath(workspaceRoot, parsed.data.project);
+        } catch (err: any) {
+          return {
+            content: [{ type: "text", text: `Invalid project path: ${err.message}` }],
+            isError: true
+          };
+        }
+      }
+
       // Validate files_changed relative paths if provided
       if (parsed.data.files_changed) {
         for (const file of parsed.data.files_changed) {
-          resolveSafePath(workspaceRoot, file);
+          resolveSafePath(targetDir, file);
         }
       }
       
-      ensureGitignore();
-      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      ensureGitignore(targetDir);
+      const logPath = path.join(targetDir, "PROJECT_LOG.md");
       const timestamp = new Date().toISOString();
       const files = parsed.data.files_changed && parsed.data.files_changed.length > 0
         ? parsed.data.files_changed.join(", ")
@@ -1339,13 +1402,14 @@ async function handleToolCall(toolName: string, args: any): Promise<any> {
 This log tracks development history and work continuity.
 
 `;
+        await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
         await fs.promises.writeFile(logPath, header + entry, "utf-8");
       } else {
         await fs.promises.appendFile(logPath, "\n" + entry, "utf-8");
       }
       
       return {
-        content: [{ type: "text", text: `Successfully logged journal entry.` }]
+        content: [{ type: "text", text: `Successfully logged journal entry to ${path.relative(workspaceRoot, logPath) || "PROJECT_LOG.md"}.` }]
       };
     }
     
@@ -1357,11 +1421,24 @@ This log tracks development history and work continuity.
           isError: true
         };
       }
+
+      let targetDir = workspaceRoot;
+      if (parsed.data.project && parsed.data.project.trim() !== "") {
+        try {
+          targetDir = resolveSafePath(workspaceRoot, parsed.data.project);
+        } catch (err: any) {
+          return {
+            content: [{ type: "text", text: `Invalid project path: ${err.message}` }],
+            isError: true
+          };
+        }
+      }
       
-      const logPath = path.join(workspaceRoot, "PROJECT_LOG.md");
+      const logPath = path.join(targetDir, "PROJECT_LOG.md");
       if (!fs.existsSync(logPath)) {
+        const targetRel = path.relative(workspaceRoot, logPath);
         return {
-          content: [{ type: "text", text: "No project log file found." }]
+          content: [{ type: "text", text: `No project log file found at ${targetRel}.` }]
         };
       }
       
