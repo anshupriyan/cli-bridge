@@ -178,11 +178,11 @@ Add `cli-bridge` to the `mcpServers` object inside your `claude_desktop_config.j
     "cli-bridge": {
       "command": "node",
       "args": [
-        "C:/Projects/cli-bridge/build/index.js",
-        "C:/Projects/my-workspace"
+        "<PATH_TO_CLI_BRIDGE>/build/index.js",
+        "<PATH_TO_YOUR_WORKSPACE>"
       ],
       "env": {
-        "WORKSPACE_ROOT": "C:/Projects/my-workspace"
+        "WORKSPACE_ROOT": "<PATH_TO_YOUR_WORKSPACE>"
       }
     }
   }
@@ -200,11 +200,11 @@ Add `cli-bridge` to the `mcpServers` object in your Qwen Studio configuration:
       "command": "npx",
       "args": [
         "node",
-        "C:/Projects/cli-bridge/build/index.js",
-        "C:/your_workspace_location"
+        "<PATH_TO_CLI_BRIDGE>/build/index.js",
+        "<PATH_TO_YOUR_WORKSPACE>"
       ],
       "env": {
-        "WORKSPACE_ROOT": "C:/your_workspace_location"
+        "WORKSPACE_ROOT": "<PATH_TO_YOUR_WORKSPACE>"
       }
     }
   }
@@ -225,8 +225,8 @@ Add `cli-bridge` to the `mcpServers` object in your Qwen Studio configuration:
 > | ✅ Double Backslash | `"C:\\Projects\\cli-bridge"` | **Valid JSON** |
 > | ✅ Forward Slash | `"C:/Projects/cli-bridge"` | **Valid & Recommended** |
 
-- Replace `C:/Projects/cli-bridge` with the folder where you cloned `cli-bridge`.
-- Replace `C:/Projects/my-workspace` with the target project workspace folder you want `cli-bridge` to manage.
+- Replace `<PATH_TO_CLI_BRIDGE>` with the folder where you cloned `cli-bridge`.
+- Replace `<PATH_TO_YOUR_WORKSPACE>` with the target project workspace folder you want `cli-bridge` to manage.
 
 ---
 
