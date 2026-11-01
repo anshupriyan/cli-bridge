@@ -387,6 +387,11 @@ const SearchFilesSchema = z.object({
   path: z.string().optional().describe("Path to search within, relative to workspace root (defaults to root)")
 });
 
+const CopyFileSchema = z.object({
+  source: z.string().describe("Path to the source file to copy (relative or absolute)"),
+  destination: z.string().describe("Path to the destination file or directory (relative or absolute)")
+});
+
 const WriteFileSchema = z.object({
   path: z.string().describe("Path to write the file to, relative to workspace root"),
   content: z.string().describe("Full content to write to the file")
@@ -890,6 +895,30 @@ const TOOLS = [
       readOnlyHint: true
     }
   },
+  {
+    name: "copy_file",
+    description: "Copy a file from source to destination. Automatically creates parent directories. Supports workspace paths or external paths authorized by policy.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          description: "Path to the source file to copy (relative or absolute)"
+        },
+        destination: {
+          type: "string",
+          description: "Path to destination file or directory (relative or absolute)"
+        }
+      },
+      required: ["source", "destination"]
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true
+    }
+  },
+
   {
     name: "write_file",
     description: "Write content to a file in the workspace, overwriting it if it already exists. Creates parent directories if needed.",
@@ -1516,6 +1545,62 @@ export async function handleToolCall(toolName: string, args: any): Promise<any> 
         policyDecision
       };
     }
+    case "copy_file": {
+      const parsed = CopyFileSchema.safeParse(args);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: `Invalid arguments: ${parsed.error.message}` }],
+          isError: true
+        };
+      }
+
+      let srcResolved: string;
+      let dstResolved: string;
+      let policyDecision: any;
+
+      if (activePolicyEngine) {
+        const srcDecision = activePolicyEngine.checkPath(parsed.data.source, "read", workspaceRoot);
+        if (!srcDecision.allowed) {
+          return {
+            content: [{ type: "text", text: `Blocked source: ${srcDecision.reason} (rule: ${srcDecision.ruleId})` }],
+            isError: true,
+            policyDecision: srcDecision,
+          };
+        }
+        srcResolved = srcDecision.canonicalPath!;
+
+        const dstDecision = activePolicyEngine.checkPath(parsed.data.destination, "write", workspaceRoot);
+        policyDecision = dstDecision;
+        if (!dstDecision.allowed) {
+          return {
+            content: [{ type: "text", text: `Blocked destination: ${dstDecision.reason} (rule: ${dstDecision.ruleId})` }],
+            isError: true,
+            policyDecision: dstDecision,
+          };
+        }
+        dstResolved = dstDecision.canonicalPath!;
+      } else {
+        srcResolved = resolveSafePath(workspaceRoot, parsed.data.source);
+        dstResolved = resolveSafePath(workspaceRoot, parsed.data.destination);
+      }
+
+      try {
+        const dstStat = await fs.promises.stat(dstResolved).catch(() => null);
+        if (dstStat && dstStat.isDirectory()) {
+          dstResolved = path.join(dstResolved, path.basename(srcResolved));
+        }
+      } catch {}
+
+      console.error(`[cli-bridge] Copying file from "${srcResolved}" to "${dstResolved}"`);
+      await fs.promises.mkdir(path.dirname(dstResolved), { recursive: true });
+      await fs.promises.copyFile(srcResolved, dstResolved);
+
+      return {
+        content: [{ type: "text", text: `Successfully copied "${parsed.data.source}" to "${dstResolved}"` }],
+        policyDecision
+      };
+    }
+
 
     case "write_file": {
       const parsed = WriteFileSchema.safeParse(args);
